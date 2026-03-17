@@ -22,6 +22,16 @@ final class AppViewModel: ObservableObject {
         let kind: Kind
     }
 
+    private enum LaunchMode {
+        case normal
+        case persistentSandbox
+    }
+
+    private struct MACSpoofResult {
+        let summary: String
+        let launchMode: LaunchMode
+    }
+
     private enum Constants {
         static let errorDomain = "1132Fixer"
         static let bashPath = "/bin/bash"
@@ -99,11 +109,14 @@ done
                 arguments: ["-c", self.stopZoomCommand]
             )
             self.appendLog("Step: Spoof MAC and reconnect active network (admin prompt expected)")
-            let macSpoofOutput: String
+            let macSpoofResult: MACSpoofResult
             do {
-                macSpoofOutput = try await self.spoofMACAndReconnectActiveInterface()
+                macSpoofResult = try await self.spoofMACAndReconnectActiveInterface()
             } catch {
-                macSpoofOutput = "MAC spoofing skipped: \(error.localizedDescription)"
+                macSpoofResult = MACSpoofResult(
+                    summary: "MAC spoofing skipped: \(error.localizedDescription)",
+                    launchMode: .persistentSandbox
+                )
             }
             self.appendLog("Step: Reset Zoom data")
             let resetOutput = try await self.runProcess(
@@ -127,10 +140,10 @@ done
             let launchOutput = try await self.runProcess(
                 stepName: "Launch Zoom",
                 executable: Constants.bashPath,
-                arguments: ["-c", self.makeLaunchZoomCommand()]
+                arguments: ["-c", self.makeLaunchZoomCommand(mode: macSpoofResult.launchMode)]
             )
 
-            return [stopZoomOutput, macSpoofOutput, resetOutput, dnsOutput, stopUpdatersOutput, launchOutput]
+            return [stopZoomOutput, macSpoofResult.summary, resetOutput, dnsOutput, stopUpdatersOutput, launchOutput]
                 .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 .joined(separator: "\n")
         }
@@ -235,14 +248,17 @@ Last action status: \(lastStatus)
         return isAppleSilicon && isMacOS14OrLater
     }
 
-    private func spoofMACAndReconnectActiveInterface() async throws -> String {
+    private func spoofMACAndReconnectActiveInterface() async throws -> MACSpoofResult {
         let interface = try await resolveActiveSupportedInterface()
 
         if interface.kind == .wifi && isMacSpoofingBlockedOnWiFi() {
-            return """
+            return MACSpoofResult(
+                summary: """
 MAC spoofing skipped: Wi-Fi MAC spoofing is not supported on Apple Silicon Macs running macOS Sonoma (14) or later. \
 Zoom will be launched in a restricted sandbox environment instead, which forces it to generate a fresh device identity.
-"""
+""",
+                launchMode: .persistentSandbox
+            )
         }
 
         let spoofedMAC = try generateRandomMACAddress()
@@ -281,8 +297,10 @@ Zoom will be launched in a restricted sandbox environment instead, which forces 
         let macVerified = !actualMAC.isEmpty && actualMAC == spoofedMAC.lowercased()
 
         let summary: String
+        let launchMode: LaunchMode
         if macVerified {
             summary = "MAC spoofed on \(interface.kind.rawValue) (\(interface.device), service: \(interface.networkService)) -> \(spoofedMAC); network service restarted"
+            launchMode = .normal
         } else {
             let detail = actualMAC.isEmpty
                 ? "Could not read the current MAC address after spoofing."
@@ -297,15 +315,19 @@ What you can try:
   3. Turn on Private Wi-Fi Address for your network in System Settings > Wi-Fi, \
 disconnect, and reconnect before running Start Zoom again.
 """
+            launchMode = .persistentSandbox
         }
 
         let trimmedCommandOutput = commandOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let combinedSummary: String
 
         if trimmedCommandOutput.isEmpty {
-            return summary
+            combinedSummary = summary
+        } else {
+            combinedSummary = "\(summary)\n\(trimmedCommandOutput)"
         }
 
-        return "\(summary)\n\(trimmedCommandOutput)"
+        return MACSpoofResult(summary: combinedSummary, launchMode: launchMode)
     }
 
     private func resolveActiveSupportedInterface() async throws -> NetworkInterfaceInfo {
@@ -448,170 +470,46 @@ disconnect, and reconnect before running Start Zoom again.
         return result
     }
 
-    private func makeLaunchZoomCommand() -> String {
+    private func makeLaunchZoomCommand(mode: LaunchMode) -> String {
         guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
             return #"""
 echo "Launch mode: directOpenFallback"
 /usr/bin/open -a "zoom.us"
 """#
         }
-        // Prefer the camera-safe bootstrap launch, but automatically escalate to the more
-        // aggressive long-running sandbox if process-state heuristics suggest the bootstrap
-        // did not stick. This keeps as much of the 1.3.5 bypass behavior as possible while
-        // still giving 1.3.6-style normal camera access the first chance to work.
+        if mode == .normal {
+            return #"""
+echo "Launch mode: normal"
+/usr/bin/open -na "zoom.us"
+"""#
+        }
+
+        // Block Zoom's data directory using filesystem permissions instead of sandbox-exec.
+        // This achieves the same 1132 bypass as v1.3.5 (Zoom cannot read its cached device
+        // fingerprint) while launching Zoom as a normal process so that cameras and
+        // microphone work correctly (sandbox-exec breaks macOS TCC camera permissions).
         let dataDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/zoom.us/data")
             .path
-        let profile = """
-(version 1)
-(allow default)
-(deny file-read*
-  (subpath "\(dataDir)")
-)
-"""
-        let encodedProfile = Data(profile.utf8).base64EncodedString()
         return """
 /bin/bash -c '
 set -u
 
-zoom_binary=\(shellSingleQuote(zoomBinaryPath))
-encoded_profile=\(shellSingleQuote(encodedProfile))
-profile_path="$(/usr/bin/mktemp "/tmp/1132fixer.zoom-sandbox.XXXXXX")" || exit 1
+data_dir=\(shellSingleQuote(dataDir))
 
-cleanup() {
-  /bin/rm -f "$profile_path"
-}
-
-wait_for_pid_runtime() {
-  pid="$1"
-  seconds="$2"
-  i=0
-  while [ "$i" -lt "$seconds" ]; do
-    if ! /bin/kill -0 "$pid" 2>/dev/null; then
-      return 1
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 0
-}
-
-wait_for_pid_exit() {
-  pid="$1"
-  attempts="$2"
-  i=0
-  while [ "$i" -lt "$attempts" ]; do
-    if ! /bin/kill -0 "$pid" 2>/dev/null; then
-      return 0
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-
-wait_for_zoom_stability() {
-  required_consecutive="$1"
-  max_attempts="$2"
-  i=0
-  stable=0
-  while [ "$i" -lt "$max_attempts" ]; do
-    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-      stable=$((stable + 1))
-      if [ "$stable" -ge "$required_consecutive" ]; then
-        return 0
-      fi
-    else
-      stable=0
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-
-stop_zoom_processes() {
-  if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-    /usr/bin/killall "zoom.us" 2>/dev/null || true
-    for i in {1..6}; do
-      /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1 || break
-      /bin/sleep 0.5
-    done
-    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-      /usr/bin/killall -9 "zoom.us" 2>/dev/null || true
-      /bin/sleep 1
-    fi
-  fi
-}
-
-launch_persistent_sandbox() {
-  echo "Launch mode escalated: persistentSandbox"
-  /usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
-  persistent_pid=$!
-  /bin/sleep 2
-  if /bin/kill -0 "$persistent_pid" 2>/dev/null || /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-    echo "Heuristic: persistent sandbox launch detected"
-    return 0
-  fi
-  echo "Heuristic: persistent sandbox launch detected = no"
-  return 1
-}
-
-trap cleanup EXIT
-/bin/echo "$encoded_profile" | /usr/bin/base64 --decode > "$profile_path" || exit 1
-
-echo "Launch mode: bootstrapThenNormal"
-/usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
-bootstrap_pid=$!
-/bin/sleep 1
-
-if /bin/kill -0 "$bootstrap_pid" 2>/dev/null; then
-  echo "Heuristic: bootstrap started"
-else
-  echo "Heuristic: bootstrap started = no"
-  echo "Heuristic: fallback triggered (bootstrap process missing)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
-
-if wait_for_pid_runtime "$bootstrap_pid" 11; then
-  echo "Heuristic: bootstrap survived minimum runtime"
-else
-  echo "Heuristic: bootstrap survived minimum runtime = no"
-  echo "Heuristic: fallback triggered (bootstrap exited too quickly)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
-
-/bin/kill "$bootstrap_pid" 2>/dev/null || true
-if wait_for_pid_exit "$bootstrap_pid" 5; then
-  echo "Heuristic: bootstrap shutdown confirmed"
-else
-  echo "Heuristic: bootstrap shutdown confirmed = no"
-fi
+/bin/mkdir -p "$data_dir"
+/bin/chmod 000 "$data_dir"
+echo "Launch mode: permissionBlock"
+echo "Blocked data directory: $data_dir"
 
 /usr/bin/open -na "zoom.us"
-if wait_for_zoom_stability 1 6; then
-  echo "Heuristic: normal relaunch detected"
-else
-  echo "Heuristic: normal relaunch detected = no"
-  echo "Heuristic: fallback triggered (normal relaunch not detected)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
 
-if wait_for_zoom_stability 4 12; then
-  echo "Heuristic: normal relaunch stabilized"
-  exit 0
-fi
-
-echo "Heuristic: normal relaunch stabilized = no"
-echo "Heuristic: fallback triggered (normal relaunch unstable)"
-stop_zoom_processes
-launch_persistent_sandbox || exit 1
+# Wait for Zoom to finish launching, then restore permissions so Zoom
+# can function normally (save settings, etc.) once it has already
+# started with a fresh device identity.
+/bin/sleep 15
+/bin/chmod 755 "$data_dir"
+echo "Restored data directory permissions"
 '
 """
     }
