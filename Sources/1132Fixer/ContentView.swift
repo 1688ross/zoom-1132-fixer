@@ -90,8 +90,8 @@ done
     private let refreshDNSAppleScript = #"do shell script "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder" with administrator privileges"#
     private let zoomBinaryPath = "/Applications/zoom.us.app/Contents/MacOS/zoom.us"
 
-    func startZoom() {
-        runTask("Start Zoom") {
+    func startZoom(onSuccess: @escaping () -> Void) {
+        runTask("Start Zoom", onSuccess: onSuccess) {
             self.appendLog("Step: Close Zoom if it is running")
             let stopZoomOutput = try await self.runProcess(
                 stepName: "Close Zoom",
@@ -450,7 +450,10 @@ disconnect, and reconnect before running Start Zoom again.
 
     private func makeLaunchZoomCommand() -> String {
         guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
-            return #"open -a "zoom.us""#
+            return #"""
+echo "Launch mode: directOpenFallback"
+/usr/bin/open -a "zoom.us"
+"""#
         }
         // Launch Zoom under a sandbox that blocks reads of its entire stored device-fingerprint
         // data directory. This forces Zoom to generate a fresh device identity, helping bypass
@@ -466,7 +469,151 @@ disconnect, and reconnect before running Start Zoom again.
   (subpath "\(dataDir)")
 )
 """
-        return "nohup /usr/bin/sandbox-exec -p \(shellSingleQuote(profile)) \(shellSingleQuote(zoomBinaryPath)) >/dev/null 2>&1 &"
+        let encodedProfile = Data(profile.utf8).base64EncodedString()
+        return """
+/bin/bash -c '
+set -u
+
+zoom_binary=\(shellSingleQuote(zoomBinaryPath))
+encoded_profile=\(shellSingleQuote(encodedProfile))
+profile_path="$(/usr/bin/mktemp "/tmp/1132fixer.zoom-sandbox.XXXXXX")" || exit 1
+
+cleanup() {
+  /bin/rm -f "$profile_path"
+}
+
+wait_for_pid_runtime() {
+  pid="$1"
+  seconds="$2"
+  i=0
+  while [ "$i" -lt "$seconds" ]; do
+    if ! /bin/kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 0
+}
+
+wait_for_pid_exit() {
+  pid="$1"
+  attempts="$2"
+  i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if ! /bin/kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_zoom_stability() {
+  required_consecutive="$1"
+  max_attempts="$2"
+  i=0
+  stable=0
+  while [ "$i" -lt "$max_attempts" ]; do
+    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+      stable=$((stable + 1))
+      if [ "$stable" -ge "$required_consecutive" ]; then
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+stop_zoom_processes() {
+  if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+    /usr/bin/killall "zoom.us" 2>/dev/null || true
+    for i in {1..6}; do
+      /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1 || break
+      /bin/sleep 0.5
+    done
+    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+      /usr/bin/killall -9 "zoom.us" 2>/dev/null || true
+      /bin/sleep 1
+    fi
+  fi
+}
+
+launch_persistent_sandbox() {
+  echo "Launch mode escalated: persistentSandbox"
+  /usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
+  persistent_pid=$!
+  /bin/sleep 2
+  if /bin/kill -0 "$persistent_pid" 2>/dev/null || /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+    echo "Heuristic: persistent sandbox launch detected"
+    return 0
+  fi
+  echo "Heuristic: persistent sandbox launch detected = no"
+  return 1
+}
+
+trap cleanup EXIT
+/bin/echo "$encoded_profile" | /usr/bin/base64 --decode > "$profile_path" || exit 1
+
+echo "Launch mode: bootstrapThenNormal"
+/usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
+bootstrap_pid=$!
+/bin/sleep 1
+
+if /bin/kill -0 "$bootstrap_pid" 2>/dev/null; then
+  echo "Heuristic: bootstrap started"
+else
+  echo "Heuristic: bootstrap started = no"
+  echo "Heuristic: fallback triggered (bootstrap process missing)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+if wait_for_pid_runtime "$bootstrap_pid" 11; then
+  echo "Heuristic: bootstrap survived minimum runtime"
+else
+  echo "Heuristic: bootstrap survived minimum runtime = no"
+  echo "Heuristic: fallback triggered (bootstrap exited too quickly)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+/bin/kill "$bootstrap_pid" 2>/dev/null || true
+if wait_for_pid_exit "$bootstrap_pid" 5; then
+  echo "Heuristic: bootstrap shutdown confirmed"
+else
+  echo "Heuristic: bootstrap shutdown confirmed = no"
+fi
+
+/usr/bin/open -na "zoom.us"
+if wait_for_zoom_stability 1 6; then
+  echo "Heuristic: normal relaunch detected"
+else
+  echo "Heuristic: normal relaunch detected = no"
+  echo "Heuristic: fallback triggered (normal relaunch not detected)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+if wait_for_zoom_stability 4 12; then
+  echo "Heuristic: normal relaunch stabilized"
+  exit 0
+fi
+
+echo "Heuristic: normal relaunch stabilized = no"
+echo "Heuristic: fallback triggered (normal relaunch unstable)"
+stop_zoom_processes
+launch_persistent_sandbox || exit 1
+'
+"""
     }
 
     private func generateRandomMACAddress() throws -> String {
@@ -594,6 +741,7 @@ struct ContentView: View {
     @State private var showBugReportForm = false
     @State private var bugReportEmail = ""
     @State private var bugReportMessage = ""
+    @State private var showBypassPrompt = false
 
     var body: some View {
         ZStack {
@@ -624,7 +772,11 @@ struct ContentView: View {
                         systemImage: "video.circle.fill",
                         tint: Color(red: 0.13, green: 0.50, blue: 0.86),
                         isDisabled: vm.isRunning,
-                        action: vm.startZoom
+                        action: {
+                            vm.startZoom {
+                                showBypassPrompt = true
+                            }
+                        }
                     )
                 }
 
@@ -664,6 +816,18 @@ struct ContentView: View {
                 Text("A newer version is available.")
             }
         }
+        .alert("Did this script make you bypass 1132?", isPresented: $showBypassPrompt) {
+            Button("Yes") {
+                Task {
+                    await submitBypassResult("Yes")
+                }
+            }
+            Button("No") {
+                Task {
+                    await submitBypassResult("No")
+                }
+            }
+        }
         .sheet(isPresented: $showBugReportForm) {
             BugReportFormSheet(
                 email: $bugReportEmail,
@@ -689,12 +853,13 @@ struct ContentView: View {
         let draft = vm.makeBugReportDraft(appVersion: appVersion)
         let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reportMessage = trimmedMessage.isEmpty ? "No user message provided." : trimmedMessage
 
         do {
             try await BugReportService.sendBugReport(
                 title: draft.title,
                 email: trimmedEmail.isEmpty ? nil : trimmedEmail,
-                message: trimmedMessage,
+                message: reportMessage,
                 systemInfo: draft.systemInfo,
                 recentLogs: draft.recentLogs
             )
@@ -704,6 +869,26 @@ struct ContentView: View {
             bugReportMessage = ""
         } catch {
             vm.logMessage("Bug report failed: \(error.localizedDescription)")
+        }
+    }
+
+    @MainActor
+    private func submitBypassResult(_ answer: String) async {
+        guard !isReportingBug else { return }
+        isReportingBug = true
+        defer { isReportingBug = false }
+
+        do {
+            try await BugReportService.sendBugReport(
+                title: "",
+                email: nil,
+                message: answer,
+                systemInfo: "",
+                recentLogs: ""
+            )
+            vm.logMessage("Bypass result submitted: \(answer)")
+        } catch {
+            vm.logMessage("Bypass result submission failed: \(error.localizedDescription)")
         }
     }
 }
@@ -725,7 +910,7 @@ private struct BugReportFormSheet: View {
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Email (optional)")
+                Text("E-mail or Telegram (optional)")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                 TextField("user@example.com", text: $email)
                     .textFieldStyle(.roundedBorder)

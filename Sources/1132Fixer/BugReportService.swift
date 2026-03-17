@@ -99,7 +99,7 @@ enum BugReportService {
             BugReportRequest(
                 title: title,
                 email: email,
-                message: message.isEmpty ? "No user message provided." : message,
+                message: message,
                 systemInfo: systemInfo,
                 recentLogs: recentLogs
             )
