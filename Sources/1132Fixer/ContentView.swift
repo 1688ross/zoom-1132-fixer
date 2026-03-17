@@ -477,17 +477,10 @@ echo "Launch mode: directOpenFallback"
 /usr/bin/open -a "zoom.us"
 """#
         }
-        if mode == .normal {
-            return #"""
-echo "Launch mode: normal"
-/usr/bin/open -na "zoom.us"
-"""#
-        }
-
-        // Block Zoom's data directory using filesystem permissions instead of sandbox-exec.
-        // This achieves the same 1132 bypass as v1.3.5 (Zoom cannot read its cached device
-        // fingerprint) while launching Zoom as a normal process so that cameras and
-        // microphone work correctly (sandbox-exec breaks macOS TCC camera permissions).
+        // Launch Zoom under a sandbox that blocks reads of its entire stored device-fingerprint
+        // data directory. This forces Zoom to generate a fresh device identity, helping bypass
+        // error 1132 on systems where ifconfig MAC spoofing is blocked (e.g. Apple Silicon
+        // with macOS Sonoma 14+).
         let dataDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/zoom.us/data")
             .path
