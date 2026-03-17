@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>ZoomWiper</string>
+	<string>1132 Fixer</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIconFile</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.wiper.ZoomWiper</string>
+	<string>com.1132fixer.1132-Fixer</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -38,9 +38,11 @@
 	<string>NSApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>1132 Fixer needs Bluetooth access to detect and spoof MAC addresses on Bluetooth-connected network interfaces.</string>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>ZoomWiper needs to monitor application launches to manage firewall rules for Zoom.</string>
+	<string>1132 Fixer needs to send Apple Events to manage network settings and application processes.</string>
 	<key>NSSystemAdministrationUsageDescription</key>
-	<string>ZoomWiper requires administrator access to remove Zoom files from system directories, manage network settings, and configure the firewall.</string>
+	<string>1132 Fixer requires administrator access to manage network settings, spoof MAC addresses, and configure the firewall.</string>
 </dict>
 </plist>

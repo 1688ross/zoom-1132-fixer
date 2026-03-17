@@ -470,41 +470,56 @@ disconnect, and reconnect before running Start Zoom again.
         return result
     }
 
+    // macOS sandbox profile (SBPL) that blocks IOKit property lookups exposing persistent
+    // hardware identifiers. With these denied, Zoom cannot read the Mac's serial number,
+    // platform UUID, or hardware MAC address, forcing it to generate a device fingerprint
+    // that does not match the banned identity.
+    private let zoomSandboxProfile = """
+(version 1)
+(allow default)
+(deny iokit-get-properties
+    (iokit-property "IOPlatformSerialNumber")
+    (iokit-property "IOPlatformUUID")
+    (iokit-property "serial-number")
+    (iokit-property "board-id")
+    (iokit-property "unique-id")
+    (iokit-property "IOMACAddress")
+)
+(deny file-read-data
+    (literal "/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist")
+)
+"""
+
     private func makeLaunchZoomCommand(mode: LaunchMode) -> String {
-        guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
+        switch mode {
+        case .normal:
             return #"""
+echo "Launch mode: normal"
+/usr/bin/open -a "zoom.us"
+"""#
+        case .persistentSandbox:
+            guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
+                return #"""
 echo "Launch mode: directOpenFallback"
 /usr/bin/open -a "zoom.us"
 """#
-        }
-        // Launch Zoom under a sandbox that blocks reads of its entire stored device-fingerprint
-        // data directory. This forces Zoom to generate a fresh device identity, helping bypass
-        // error 1132 on systems where ifconfig MAC spoofing is blocked (e.g. Apple Silicon
-        // with macOS Sonoma 14+).
-        let dataDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/zoom.us/data")
-            .path
-        return """
-/bin/bash -c '
-set -u
-
-data_dir=\(shellSingleQuote(dataDir))
-
-/bin/mkdir -p "$data_dir"
-/bin/chmod 000 "$data_dir"
-echo "Launch mode: permissionBlock"
-echo "Blocked data directory: $data_dir"
-
-/usr/bin/open -na "zoom.us"
-
-# Wait for Zoom to finish launching, then restore permissions so Zoom
-# can function normally (save settings, etc.) once it has already
-# started with a fresh device identity.
-/bin/sleep 15
-/bin/chmod 755 "$data_dir"
-echo "Restored data directory permissions"
-'
+            }
+            // Use sandbox-exec to launch Zoom with hardware identity lookups blocked.
+            // The binary is launched directly (not via `open`) so the sandbox applies
+            // to the Zoom process itself.
+            return """
+echo "Launch mode: sandboxExec"
+sandbox_profile=$(/usr/bin/mktemp /tmp/zoom-sandbox.XXXXXX)
+/bin/cat > "$sandbox_profile" <<'SBPL'
+\(zoomSandboxProfile)SBPL
+echo "Sandbox profile written to $sandbox_profile"
+/usr/bin/sandbox-exec -f "$sandbox_profile" \(shellSingleQuote(zoomBinaryPath)) &
+zoom_pid=$!
+echo "Zoom launched under sandbox (PID: $zoom_pid)"
+/bin/sleep 3
+/bin/rm -f "$sandbox_profile"
 """
+        }
     }
 
     private func generateRandomMACAddress() throws -> String {
