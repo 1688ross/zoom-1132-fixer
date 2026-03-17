@@ -137,10 +137,16 @@ done
                 arguments: ["-c", self.stopZoomUpdatersCommand]
             )
             self.appendLog("Step: Launch Zoom")
+            let sandboxProfilePath: String?
+            if macSpoofResult.launchMode == .persistentSandbox {
+                sandboxProfilePath = try self.writeSandboxProfile()
+            } else {
+                sandboxProfilePath = nil
+            }
             let launchOutput = try await self.runProcess(
                 stepName: "Launch Zoom",
                 executable: Constants.bashPath,
-                arguments: ["-c", self.makeLaunchZoomCommand(mode: macSpoofResult.launchMode)]
+                arguments: ["-c", self.makeLaunchZoomCommand(mode: macSpoofResult.launchMode, sandboxProfilePath: sandboxProfilePath)]
             )
 
             return [stopZoomOutput, macSpoofResult.summary, resetOutput, dnsOutput, stopUpdatersOutput, launchOutput]
@@ -490,7 +496,15 @@ disconnect, and reconnect before running Start Zoom again.
 )
 """
 
-    private func makeLaunchZoomCommand(mode: LaunchMode) -> String {
+    /// Writes the sandbox profile to a temporary file and returns its path.
+    private func writeSandboxProfile() throws -> String {
+        let tmpDir = FileManager.default.temporaryDirectory
+        let profileURL = tmpDir.appendingPathComponent("zoom-sandbox-\(UUID().uuidString).sb")
+        try zoomSandboxProfile.write(to: profileURL, atomically: true, encoding: .utf8)
+        return profileURL.path
+    }
+
+    private func makeLaunchZoomCommand(mode: LaunchMode, sandboxProfilePath: String?) -> String {
         switch mode {
         case .normal:
             return #"""
@@ -498,7 +512,8 @@ echo "Launch mode: normal"
 /usr/bin/open -a "zoom.us"
 """#
         case .persistentSandbox:
-            guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
+            guard FileManager.default.fileExists(atPath: zoomBinaryPath),
+                  let profilePath = sandboxProfilePath else {
                 return #"""
 echo "Launch mode: directOpenFallback"
 /usr/bin/open -a "zoom.us"
@@ -509,15 +524,11 @@ echo "Launch mode: directOpenFallback"
             // to the Zoom process itself.
             return """
 echo "Launch mode: sandboxExec"
-sandbox_profile=$(/usr/bin/mktemp /tmp/zoom-sandbox.XXXXXX)
-/bin/cat > "$sandbox_profile" <<'SBPL'
-\(zoomSandboxProfile)SBPL
-echo "Sandbox profile written to $sandbox_profile"
-/usr/bin/sandbox-exec -f "$sandbox_profile" \(shellSingleQuote(zoomBinaryPath)) &
+/usr/bin/sandbox-exec -f \(shellSingleQuote(profilePath)) \(shellSingleQuote(zoomBinaryPath)) &
 zoom_pid=$!
 echo "Zoom launched under sandbox (PID: $zoom_pid)"
 /bin/sleep 3
-/bin/rm -f "$sandbox_profile"
+/bin/rm -f \(shellSingleQuote(profilePath))
 """
         }
     }
