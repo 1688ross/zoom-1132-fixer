@@ -100,8 +100,8 @@ done
     private let refreshDNSAppleScript = #"do shell script "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder" with administrator privileges"#
     private let zoomBinaryPath = "/Applications/zoom.us.app/Contents/MacOS/zoom.us"
 
-    func startZoom(onSuccess: @escaping () -> Void) {
-        runTask("Start Zoom", onSuccess: onSuccess) {
+    func startZoom() {
+        runTask("Start Zoom") {
             self.appendLog("Step: Close Zoom if it is running")
             let stopZoomOutput = try await self.runProcess(
                 stepName: "Close Zoom",
@@ -140,6 +140,7 @@ done
             let sandboxProfilePath: String?
             if macSpoofResult.launchMode == .persistentSandbox {
                 sandboxProfilePath = try self.writeSandboxProfile()
+                self.appendLog("Note: Zoom is launching in sandbox mode. If the camera does not work, go to System Settings > Privacy & Security > Camera and make sure Zoom is allowed.")
             } else {
                 sandboxProfilePath = nil
             }
@@ -190,7 +191,6 @@ Last action status: \(lastStatus)
 
     private func runTask(
         _ title: String,
-        onSuccess: (() -> Void)? = nil,
         action: @escaping () async throws -> String
     ) {
         guard !isRunning else {
@@ -209,7 +209,6 @@ Last action status: \(lastStatus)
                     appendLog(output)
                 }
                 appendLog("Done.")
-                onSuccess?()
             } catch {
                 appendLog("Error: \(error.localizedDescription)")
             }
@@ -483,6 +482,8 @@ disconnect, and reconnect before running Start Zoom again.
     private let zoomSandboxProfile = """
 (version 1)
 (allow default)
+(allow device-camera)
+(allow device-microphone)
 (deny iokit-get-properties
     (iokit-property "IOPlatformSerialNumber")
     (iokit-property "IOPlatformUUID")
@@ -656,7 +657,6 @@ struct ContentView: View {
     @State private var showBugReportForm = false
     @State private var bugReportEmail = ""
     @State private var bugReportMessage = ""
-    @State private var showBypassPrompt = false
 
     var body: some View {
         ZStack {
@@ -688,9 +688,7 @@ struct ContentView: View {
                         tint: Color(red: 0.13, green: 0.50, blue: 0.86),
                         isDisabled: vm.isRunning,
                         action: {
-                            vm.startZoom {
-                                showBypassPrompt = true
-                            }
+                            vm.startZoom()
                         }
                     )
                 }
@@ -729,18 +727,6 @@ struct ContentView: View {
                 Text("Version \(release.version) is available. You have \(appVersion).")
             } else {
                 Text("A newer version is available.")
-            }
-        }
-        .alert("Did this script make you bypass 1132?", isPresented: $showBypassPrompt) {
-            Button("Yes") {
-                Task {
-                    await submitBypassResult("Yes")
-                }
-            }
-            Button("No") {
-                Task {
-                    await submitBypassResult("No")
-                }
             }
         }
         .sheet(isPresented: $showBugReportForm) {
@@ -784,26 +770,6 @@ struct ContentView: View {
             bugReportMessage = ""
         } catch {
             vm.logMessage("Bug report failed: \(error.localizedDescription)")
-        }
-    }
-
-    @MainActor
-    private func submitBypassResult(_ answer: String) async {
-        guard !isReportingBug else { return }
-        isReportingBug = true
-        defer { isReportingBug = false }
-
-        do {
-            try await BugReportService.sendBugReport(
-                title: "",
-                email: nil,
-                message: answer,
-                systemInfo: "",
-                recentLogs: ""
-            )
-            vm.logMessage("Bypass result submitted: \(answer)")
-        } catch {
-            vm.logMessage("Bypass result submission failed: \(error.localizedDescription)")
         }
     }
 }
