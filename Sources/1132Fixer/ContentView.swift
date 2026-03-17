@@ -486,9 +486,7 @@ disconnect, and reconnect before running Start Zoom again.
 (deny iokit-get-properties
     (iokit-property "IOPlatformSerialNumber")
     (iokit-property "IOPlatformUUID")
-    (iokit-property "serial-number")
     (iokit-property "board-id")
-    (iokit-property "unique-id")
     (iokit-property "IOMACAddress")
 )
 (deny file-read-data
