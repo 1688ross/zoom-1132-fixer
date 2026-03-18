@@ -22,14 +22,8 @@ final class AppViewModel: ObservableObject {
         let kind: Kind
     }
 
-    private enum LaunchMode {
-        case normal
-        case persistentSandbox
-    }
-
     private struct MACSpoofResult {
         let summary: String
-        let launchMode: LaunchMode
     }
 
     private enum Constants {
@@ -114,8 +108,7 @@ done
                 macSpoofResult = try await self.spoofMACAndReconnectActiveInterface()
             } catch {
                 macSpoofResult = MACSpoofResult(
-                    summary: "MAC spoofing skipped: \(error.localizedDescription)",
-                    launchMode: .persistentSandbox
+                    summary: "MAC spoofing skipped: \(error.localizedDescription)"
                 )
             }
             self.appendLog("Step: Reset Zoom data")
@@ -137,17 +130,10 @@ done
                 arguments: ["-c", self.stopZoomUpdatersCommand]
             )
             self.appendLog("Step: Launch Zoom")
-            let sandboxProfilePath: String?
-            if macSpoofResult.launchMode == .persistentSandbox {
-                sandboxProfilePath = try self.writeSandboxProfile()
-                self.appendLog("Note: Zoom is launching in sandbox mode. If the camera does not work, go to System Settings > Privacy & Security > Camera and make sure Zoom is allowed.")
-            } else {
-                sandboxProfilePath = nil
-            }
             let launchOutput = try await self.runProcess(
                 stepName: "Launch Zoom",
                 executable: Constants.bashPath,
-                arguments: ["-c", self.makeLaunchZoomCommand(mode: macSpoofResult.launchMode, sandboxProfilePath: sandboxProfilePath)]
+                arguments: ["-c", self.makeLaunchZoomCommand()]
             )
 
             return [stopZoomOutput, macSpoofResult.summary, resetOutput, dnsOutput, stopUpdatersOutput, launchOutput]
@@ -261,8 +247,7 @@ Last action status: \(lastStatus)
                 summary: """
 MAC spoofing skipped: Wi-Fi MAC spoofing is not supported on Apple Silicon Macs running macOS Sonoma (14) or later. \
 Zoom will be launched in a restricted sandbox environment instead, which forces it to generate a fresh device identity.
-""",
-                launchMode: .persistentSandbox
+"""
             )
         }
 
@@ -302,10 +287,8 @@ Zoom will be launched in a restricted sandbox environment instead, which forces 
         let macVerified = !actualMAC.isEmpty && actualMAC == spoofedMAC.lowercased()
 
         let summary: String
-        let launchMode: LaunchMode
         if macVerified {
             summary = "MAC spoofed on \(interface.kind.rawValue) (\(interface.device), service: \(interface.networkService)) -> \(spoofedMAC); network service restarted"
-            launchMode = .normal
         } else {
             let detail = actualMAC.isEmpty
                 ? "Could not read the current MAC address after spoofing."
@@ -320,7 +303,6 @@ What you can try:
   3. Turn on Private Wi-Fi Address for your network in System Settings > Wi-Fi, \
 disconnect, and reconnect before running Start Zoom again.
 """
-            launchMode = .persistentSandbox
         }
 
         let trimmedCommandOutput = commandOutput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -332,7 +314,7 @@ disconnect, and reconnect before running Start Zoom again.
             combinedSummary = "\(summary)\n\(trimmedCommandOutput)"
         }
 
-        return MACSpoofResult(summary: combinedSummary, launchMode: launchMode)
+        return MACSpoofResult(summary: combinedSummary)
     }
 
     private func resolveActiveSupportedInterface() async throws -> NetworkInterfaceInfo {
@@ -475,11 +457,19 @@ disconnect, and reconnect before running Start Zoom again.
         return result
     }
 
-    // macOS sandbox profile (SBPL) that blocks IOKit property lookups exposing persistent
-    // hardware identifiers. With these denied, Zoom cannot read the Mac's serial number,
-    // platform UUID, or hardware MAC address, forcing it to generate a device fingerprint
-    // that does not match the banned identity.
-    private let zoomSandboxProfile = """
+
+    private func makeLaunchZoomCommand() -> String {
+        guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
+            return #"""
+echo "Launch mode: directOpenFallback"
+/usr/bin/open -a "zoom.us"
+"""#
+        }
+        // Prefer the camera-safe bootstrap launch, but automatically escalate to the more
+        // aggressive long-running sandbox if process-state heuristics suggest the bootstrap
+        // did not stick. This keeps as much of the 1.3.5 bypass behavior as possible while
+        // still giving 1.3.6-style normal camera access the first chance to work.
+        let profile = """
 (version 1)
 (allow default)
 (allow device-camera)
@@ -494,42 +484,151 @@ disconnect, and reconnect before running Start Zoom again.
     (literal "/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist")
 )
 """
+        let encodedProfile = Data(profile.utf8).base64EncodedString()
+        return """
+/bin/bash -c '
+set -u
 
-    /// Writes the sandbox profile to a temporary file and returns its path.
-    private func writeSandboxProfile() throws -> String {
-        let tmpDir = FileManager.default.temporaryDirectory
-        let profileURL = tmpDir.appendingPathComponent("zoom-sandbox-\(UUID().uuidString).sb")
-        try zoomSandboxProfile.write(to: profileURL, atomically: true, encoding: .utf8)
-        return profileURL.path
-    }
+zoom_binary=\(shellSingleQuote(zoomBinaryPath))
+encoded_profile=\(shellSingleQuote(encodedProfile))
+profile_path="$(/usr/bin/mktemp "/tmp/1132fixer.zoom-sandbox.XXXXXX")" || exit 1
 
-    private func makeLaunchZoomCommand(mode: LaunchMode, sandboxProfilePath: String?) -> String {
-        switch mode {
-        case .normal:
-            return #"""
-echo "Launch mode: normal"
-/usr/bin/open -a "zoom.us"
-"""#
-        case .persistentSandbox:
-            guard FileManager.default.fileExists(atPath: zoomBinaryPath),
-                  let profilePath = sandboxProfilePath else {
-                return #"""
-echo "Launch mode: directOpenFallback"
-/usr/bin/open -a "zoom.us"
-"""#
-            }
-            // Use sandbox-exec to launch Zoom with hardware identity lookups blocked.
-            // The binary is launched directly (not via `open`) so the sandbox applies
-            // to the Zoom process itself.
-            return """
-echo "Launch mode: sandboxExec"
-/usr/bin/sandbox-exec -f \(shellSingleQuote(profilePath)) \(shellSingleQuote(zoomBinaryPath)) &
-zoom_pid=$!
-echo "Zoom launched under sandbox (PID: $zoom_pid)"
-/bin/sleep 3
-/bin/rm -f \(shellSingleQuote(profilePath))
+cleanup() {
+  /bin/rm -f "$profile_path"
+}
+
+wait_for_pid_runtime() {
+  pid="$1"
+  seconds="$2"
+  i=0
+  while [ "$i" -lt "$seconds" ]; do
+    if ! /bin/kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 0
+}
+
+wait_for_pid_exit() {
+  pid="$1"
+  attempts="$2"
+  i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if ! /bin/kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_zoom_stability() {
+  required_consecutive="$1"
+  max_attempts="$2"
+  i=0
+  stable=0
+  while [ "$i" -lt "$max_attempts" ]; do
+    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+      stable=$((stable + 1))
+      if [ "$stable" -ge "$required_consecutive" ]; then
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    /bin/sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+stop_zoom_processes() {
+  if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+    /usr/bin/killall "zoom.us" 2>/dev/null || true
+    for i in {1..6}; do
+      /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1 || break
+      /bin/sleep 0.5
+    done
+    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+      /usr/bin/killall -9 "zoom.us" 2>/dev/null || true
+      /bin/sleep 1
+    fi
+  fi
+}
+
+launch_persistent_sandbox() {
+  echo "Launch mode escalated: persistentSandbox"
+  /usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
+  persistent_pid=$!
+  /bin/sleep 2
+  if /bin/kill -0 "$persistent_pid" 2>/dev/null || /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
+    echo "Heuristic: persistent sandbox launch detected"
+    return 0
+  fi
+  echo "Heuristic: persistent sandbox launch detected = no"
+  return 1
+}
+
+trap cleanup EXIT
+/bin/echo "$encoded_profile" | /usr/bin/base64 --decode > "$profile_path" || exit 1
+
+echo "Launch mode: bootstrapThenNormal"
+/usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
+bootstrap_pid=$!
+/bin/sleep 1
+
+if /bin/kill -0 "$bootstrap_pid" 2>/dev/null; then
+  echo "Heuristic: bootstrap started"
+else
+  echo "Heuristic: bootstrap started = no"
+  echo "Heuristic: fallback triggered (bootstrap process missing)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+if wait_for_pid_runtime "$bootstrap_pid" 11; then
+  echo "Heuristic: bootstrap survived minimum runtime"
+else
+  echo "Heuristic: bootstrap survived minimum runtime = no"
+  echo "Heuristic: fallback triggered (bootstrap exited too quickly)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+/bin/kill "$bootstrap_pid" 2>/dev/null || true
+if wait_for_pid_exit "$bootstrap_pid" 5; then
+  echo "Heuristic: bootstrap shutdown confirmed"
+else
+  echo "Heuristic: bootstrap shutdown confirmed = no"
+fi
+
+/usr/bin/open -na "zoom.us"
+if wait_for_zoom_stability 1 6; then
+  echo "Heuristic: normal relaunch detected"
+else
+  echo "Heuristic: normal relaunch detected = no"
+  echo "Heuristic: fallback triggered (normal relaunch not detected)"
+  stop_zoom_processes
+  launch_persistent_sandbox || exit 1
+  exit 0
+fi
+
+if wait_for_zoom_stability 4 12; then
+  echo "Heuristic: normal relaunch stabilized"
+  exit 0
+fi
+
+echo "Heuristic: normal relaunch stabilized = no"
+echo "Heuristic: fallback triggered (normal relaunch unstable)"
+stop_zoom_processes
+launch_persistent_sandbox || exit 1
+'
 """
-        }
     }
 
     private func generateRandomMACAddress() throws -> String {
