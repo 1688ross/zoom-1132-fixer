@@ -815,15 +815,17 @@ struct ContentView: View {
             }
         }
         .alert("Update Available", isPresented: $updateAlertIsPresented) {
-            if let release = latestRelease {
-                Button("Open Release") {
-                    NSWorkspace.shared.open(release.htmlURL)
-                }
+            Button("Download Update") {
+                NSWorkspace.shared.open(websiteURL)
             }
             Button("Later", role: .cancel) {}
         } message: {
             if let release = latestRelease {
-                Text("Version \(release.version) is available. You have \(appVersion).")
+                if let notes = release.releaseNotes, !notes.isEmpty {
+                    Text("Version \(release.version) is available. You have \(appVersion).\n\n\(notes)")
+                } else {
+                    Text("Version \(release.version) is available. You have \(appVersion).")
+                }
             } else {
                 Text("A newer version is available.")
             }

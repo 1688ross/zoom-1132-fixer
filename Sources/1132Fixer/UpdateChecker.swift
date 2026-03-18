@@ -3,6 +3,7 @@ import Foundation
 struct ReleaseInfo: Equatable {
     let version: String
     let htmlURL: URL
+    let releaseNotes: String?
 }
 
 enum UpdateChecker {
@@ -15,12 +16,14 @@ enum UpdateChecker {
     private struct GitHubRelease: Decodable {
         let tagName: String
         let htmlURL: String
+        let body: String?
         let draft: Bool?
         let prerelease: Bool?
 
         enum CodingKeys: String, CodingKey {
             case tagName = "tag_name"
             case htmlURL = "html_url"
+            case body
             case draft
             case prerelease
         }
@@ -67,7 +70,7 @@ enum UpdateChecker {
             )
         }
 
-        return ReleaseInfo(version: version, htmlURL: htmlURL)
+        return ReleaseInfo(version: version, htmlURL: htmlURL, releaseNotes: decoded.body)
     }
 
     static func normalizeVersion(_ raw: String) -> String {
