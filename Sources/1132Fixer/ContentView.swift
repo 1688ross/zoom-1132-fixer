@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -28,8 +29,8 @@ final class AppViewModel: ObservableObject {
 
     private enum Constants {
         static let errorDomain = "1132Fixer"
-        static let bashPath = "/bin/bash"
-        static let osascriptPath = "/usr/bin/osascript"
+        static let bashPath = ShellCommands.bashPath
+        static let osascriptPath = ShellCommands.osascriptPath
     }
 
     private final class LockedDataBuffer {
@@ -61,89 +62,383 @@ final class AppViewModel: ObservableObject {
         return formatter
     }()
 
-    @Published var logs: [String] = []
-    @Published var isRunning = false
-    private let stopZoomCommand = #"""
-if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-  /usr/bin/killall "zoom.us" 2>/dev/null || true
-  echo "Zoom was running and has been closed."
-  for i in {1..10}; do
-    /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1 || break
-    /bin/sleep 0.5
-  done
-  if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-    /usr/bin/killall -9 "zoom.us" 2>/dev/null || true
-    /bin/sleep 1
-  fi
-fi
-"""#
-    private let resetZoomDataCommand = #"rm -rf "$HOME/Library/Application Support/zoom.us" "$HOME/Library/Caches/us.zoom.xos" "$HOME/Library/Preferences/us.zoom.xos.plist" "$HOME/Library/Logs/zoom.us.log"* "$HOME/Library/Saved Application State/us.zoom.xos.savedState"; defaults delete us.zoom.xos 2>/dev/null || true"#
-    private let stopZoomUpdatersCommand = #"""
-for proc in zAutoUpdate zPTUpdaterUI ZoomUpdater; do
-  /usr/bin/pkill -x "$proc" 2>/dev/null || true
-done
+    enum WorkflowState: Equatable {
+        case idle
+        case preflight
+        case closingZoom
+        case spoofingMAC
+        case backingUpState
+        case clearingState
+        case flushingDNS
+        case stoppingUpdaters
+        case launchingZoom
+        case completed
+        case failed(String)
+        case canceled
+    }
 
-for domain in gui/"$(/usr/bin/id -u)" user; do
-  for label in us.zoom.zAutoUpdate us.zoom.ZoomUpdater us.zoom.zPTUpdaterUI; do
-    /bin/launchctl bootout "$domain" "/Library/LaunchAgents/$label.plist" 2>/dev/null || true
-    /bin/launchctl bootout "$domain" "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null || true
-    /bin/launchctl disable "$domain/$label" 2>/dev/null || true
-  done
-done
-"""#
-    private let refreshDNSAppleScript = #"do shell script "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder" with administrator privileges"#
-    private let zoomBinaryPath = "/Applications/zoom.us.app/Contents/MacOS/zoom.us"
+    struct StepResult: Identifiable, Equatable {
+        let id: String
+        let name: String
+        let succeeded: Bool
+        let detail: String?
+    }
+
+    struct PreflightInfo: Equatable {
+        enum Status: Equatable {
+            case loading
+            case ready
+            case error(String)
+        }
+
+        struct Check: Identifiable, Equatable {
+            let id: String
+            let label: String
+            let value: String
+            let isWarning: Bool
+        }
+
+        var status: Status = .loading
+        var checks: [Check] = []
+    }
+
+    @Published var logs: [String] = []
+    struct WorkflowProgress: Equatable {
+        struct Step: Identifiable, Equatable {
+            let id: String
+            let name: String
+            var state: StepState
+        }
+        enum StepState: Equatable {
+            case pending, running, succeeded, failed, skipped
+        }
+        var steps: [Step] = []
+        var currentStepIndex: Int = 0
+    }
+
+    @Published var isRunning = false
+    @Published var workflowState: WorkflowState = .idle
+    @Published var preflight = PreflightInfo()
+    @Published var lastRunResults: [StepResult]?
+    @Published var workflowProgress: WorkflowProgress?
+    private var runningTask: Task<Void, Never>?
+    private var currentProcess: Process?
+    private let stopZoomCommand = ShellCommands.stopZoom
+    private let resetZoomDataCommand = ShellCommands.resetZoomData
+    private let stopZoomUpdatersCommand = ShellCommands.stopZoomUpdaters
+    private let refreshDNSAppleScript = ShellCommands.refreshDNSAppleScript
+    private let zoomBinaryPath = ShellCommands.zoomBinaryPath
 
     func startZoom() {
+        lastRunResults = nil
+        initProgress(steps: [
+            ("closeZoom", "Close Zoom"),
+            ("macSpoof", "MAC Spoof & Network"),
+            ("backup", "Backup State"),
+            ("resetData", "Clear Local State"),
+            ("dns", "DNS Flush"),
+            ("updaters", "Stop Updaters"),
+            ("launch", "Launch Zoom"),
+        ])
         runTask("Start Zoom") {
+            var results: [StepResult] = []
+
+            // 1. Close Zoom
+            self.workflowState = .closingZoom
+            self.markStepRunning("closeZoom")
             self.appendLog("Step: Close Zoom if it is running")
-            let stopZoomOutput = try await self.runProcess(
-                stepName: "Close Zoom",
-                executable: Constants.bashPath,
-                arguments: ["-c", self.stopZoomCommand]
-            )
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Close Zoom",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", self.stopZoomCommand]
+                )
+                self.markStepDone("closeZoom", succeeded: true)
+                results.append(.init(id: "closeZoom", name: "Close Zoom", succeeded: true, detail: output.isEmpty ? nil : output))
+            } catch {
+                self.markStepDone("closeZoom", succeeded: false)
+                results.append(.init(id: "closeZoom", name: "Close Zoom", succeeded: false, detail: error.localizedDescription))
+                self.appendLog("Warning: \(error.localizedDescription)")
+            }
+
+            // 2. Spoof MAC
+            self.workflowState = .spoofingMAC
+            self.markStepRunning("macSpoof")
             self.appendLog("Step: Spoof MAC and reconnect active network (admin prompt expected)")
             let macSpoofResult: MACSpoofResult
             do {
                 macSpoofResult = try await self.spoofMACAndReconnectActiveInterface()
+                let isWarning = macSpoofResult.summary.contains("Warning:")
+                self.markStepDone("macSpoof", succeeded: !isWarning)
+                results.append(.init(id: "macSpoof", name: "MAC Spoof & Network", succeeded: !isWarning, detail: macSpoofResult.summary))
             } catch {
-                macSpoofResult = MACSpoofResult(
-                    summary: "MAC spoofing skipped: \(error.localizedDescription)"
-                )
+                macSpoofResult = MACSpoofResult(summary: "MAC spoofing skipped: \(error.localizedDescription)")
+                self.markStepDone("macSpoof", succeeded: false)
+                results.append(.init(id: "macSpoof", name: "MAC Spoof & Network", succeeded: false, detail: error.localizedDescription))
             }
-            self.appendLog("Step: Reset Zoom data")
-            let resetOutput = try await self.runProcess(
-                stepName: "Reset Zoom data",
-                executable: Constants.bashPath,
-                arguments: ["-c", self.resetZoomDataCommand]
-            )
-            self.appendLog("Step: Refresh DNS cache (admin prompt may appear)")
-            let dnsOutput = try await self.runProcess(
-                stepName: "Refresh DNS cache",
-                executable: Constants.osascriptPath,
-                arguments: ["-e", self.refreshDNSAppleScript]
-            )
-            self.appendLog("Step: Stop Zoom updaters")
-            let stopUpdatersOutput = try await self.runProcess(
-                stepName: "Stop Zoom updaters",
-                executable: Constants.bashPath,
-                arguments: ["-c", self.stopZoomUpdatersCommand]
-            )
-            self.appendLog("Step: Launch Zoom")
-            let launchOutput = try await self.runProcess(
-                stepName: "Launch Zoom",
-                executable: Constants.bashPath,
-                arguments: ["-c", self.makeLaunchZoomCommand()]
-            )
 
-            return [stopZoomOutput, macSpoofResult.summary, resetOutput, dnsOutput, stopUpdatersOutput, launchOutput]
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            // 3. Backup Zoom state
+            self.workflowState = .backingUpState
+            self.markStepRunning("backup")
+            self.appendLog("Step: Backup Zoom local state")
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Backup Zoom state",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", ShellCommands.makeBackupZoomDataCommand()],
+                    timeout: 30
+                )
+                let backupPath = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.markStepDone("backup", succeeded: true)
+                results.append(.init(id: "backup", name: "Backup State", succeeded: true, detail: backupPath.isEmpty ? nil : "Saved to \(backupPath)"))
+            } catch {
+                self.markStepDone("backup", succeeded: false)
+                results.append(.init(id: "backup", name: "Backup State", succeeded: false, detail: error.localizedDescription))
+                self.appendLog("Warning: Backup failed, continuing anyway: \(error.localizedDescription)")
+            }
+
+            // 4. Reset Zoom data
+            self.workflowState = .clearingState
+            self.markStepRunning("resetData")
+            self.appendLog("Step: Reset Zoom data")
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Reset Zoom data",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", self.resetZoomDataCommand]
+                )
+                self.markStepDone("resetData", succeeded: true)
+                results.append(.init(id: "resetData", name: "Clear Local State", succeeded: true, detail: output.isEmpty ? nil : output))
+            } catch {
+                self.markStepDone("resetData", succeeded: false)
+                results.append(.init(id: "resetData", name: "Clear Local State", succeeded: false, detail: error.localizedDescription))
+                self.appendLog("Warning: \(error.localizedDescription)")
+            }
+
+            // 5. DNS flush
+            self.workflowState = .flushingDNS
+            self.markStepRunning("dns")
+            self.appendLog("Step: Refresh DNS cache (admin prompt may appear)")
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Refresh DNS cache",
+                    executable: Constants.osascriptPath,
+                    arguments: ["-e", self.refreshDNSAppleScript]
+                )
+                self.markStepDone("dns", succeeded: true)
+                results.append(.init(id: "dns", name: "DNS Flush", succeeded: true, detail: output.isEmpty ? nil : output))
+            } catch {
+                self.markStepDone("dns", succeeded: false)
+                results.append(.init(id: "dns", name: "DNS Flush", succeeded: false, detail: error.localizedDescription))
+                self.appendLog("Warning: \(error.localizedDescription)")
+            }
+
+            // 6. Stop updaters
+            self.workflowState = .stoppingUpdaters
+            self.markStepRunning("updaters")
+            self.appendLog("Step: Stop Zoom updaters")
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Stop Zoom updaters",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", self.stopZoomUpdatersCommand]
+                )
+                self.markStepDone("updaters", succeeded: true)
+                results.append(.init(id: "updaters", name: "Stop Updaters", succeeded: true, detail: output.isEmpty ? nil : output))
+            } catch {
+                self.markStepDone("updaters", succeeded: false)
+                results.append(.init(id: "updaters", name: "Stop Updaters", succeeded: false, detail: error.localizedDescription))
+                self.appendLog("Warning: \(error.localizedDescription)")
+            }
+
+            // 7. Launch Zoom
+            self.workflowState = .launchingZoom
+            self.markStepRunning("launch")
+            self.appendLog("Step: Launch Zoom")
+            do {
+                let output = try await self.runProcess(
+                    stepName: "Launch Zoom",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", ShellCommands.makeLaunchZoomCommand()],
+                    timeout: 120
+                )
+                self.markStepDone("launch", succeeded: true)
+                results.append(.init(id: "launch", name: "Launch Zoom", succeeded: true, detail: output.isEmpty ? nil : output))
+            } catch {
+                self.markStepDone("launch", succeeded: false)
+                results.append(.init(id: "launch", name: "Launch Zoom", succeeded: false, detail: error.localizedDescription))
+                throw error // Launch failure is fatal
+            }
+
+            self.lastRunResults = results
+
+            let allSucceeded = results.allSatisfy(\.succeeded)
+            let failedSteps = results.filter { !$0.succeeded }.map(\.name)
+            let summaryParts = results.map { step in
+                "\(step.succeeded ? "OK" : "WARN") \(step.name)\(step.detail.map { ": \($0.prefix(80))" } ?? "")"
+            }
+
+            let header = allSucceeded
+                ? "All steps completed successfully."
+                : "Completed with warnings: \(failedSteps.joined(separator: ", "))"
+
+            return header + "\n" + summaryParts
                 .joined(separator: "\n")
+        }
+    }
+
+    private func initProgress(steps: [(id: String, name: String)]) {
+        workflowProgress = WorkflowProgress(
+            steps: steps.map { .init(id: $0.id, name: $0.name, state: .pending) },
+            currentStepIndex: 0
+        )
+    }
+
+    private func markStepRunning(_ id: String) {
+        guard var progress = workflowProgress,
+              let idx = progress.steps.firstIndex(where: { $0.id == id }) else { return }
+        progress.steps[idx].state = .running
+        progress.currentStepIndex = idx
+        workflowProgress = progress
+    }
+
+    private func markStepDone(_ id: String, succeeded: Bool) {
+        guard var progress = workflowProgress,
+              let idx = progress.steps.firstIndex(where: { $0.id == id }) else { return }
+        progress.steps[idx].state = succeeded ? .succeeded : .failed
+        workflowProgress = progress
+    }
+
+    func cancelWorkflow() {
+        runningTask?.cancel()
+        currentProcess?.terminate()
+        workflowState = .canceled
+        appendLog("Workflow canceled by user.")
+        isRunning = false
+    }
+
+    func dryRun() {
+        lastRunResults = nil
+        workflowProgress = nil
+        runTask("Dry Run") {
+            var results: [String] = []
+
+            // Check macOS version
+            let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+            results.append("macOS: \(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)")
+
+            // Check architecture
+            let arch = ShellCommands.machineArchitecture()
+            results.append("Architecture: \(arch == "arm64" ? "Apple Silicon" : (arch == "x86_64" ? "Intel" : arch))")
+
+            // Check Zoom
+            let zoomInstalled = FileManager.default.fileExists(atPath: self.zoomBinaryPath)
+            results.append("Zoom binary: \(zoomInstalled ? "Found" : "NOT FOUND at \(self.zoomBinaryPath)")")
+
+            let zoomRunning = (try? await self.runProcess(
+                stepName: "Check Zoom process",
+                executable: Constants.bashPath,
+                arguments: ["-c", "/usr/bin/pgrep -x \"zoom.us\" >/dev/null 2>&1 && echo running || echo stopped"]
+            ))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+            results.append("Zoom process: \(zoomRunning)")
+
+            // Check network interface
+            do {
+                let routeOutput = try await self.runProcess(
+                    stepName: "Detect interface",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", "/sbin/route -n get default 2>/dev/null"]
+                )
+                let device = try ShellCommands.parseDefaultRouteInterface(from: routeOutput)
+
+                let portsOutput = try await self.runProcess(
+                    stepName: "Hardware ports",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", "/usr/sbin/networksetup -listallhardwareports"]
+                )
+                let portMap = ShellCommands.parseHardwarePorts(from: portsOutput)
+                let portName = portMap[device] ?? "Unknown"
+                results.append("Active interface: \(portName) (\(device))")
+
+                if let kind = try? ShellCommands.classifySupportedInterface(hardwarePortName: portName) {
+                    results.append("Interface type: \(kind.rawValue)")
+                    if kind == .wifi && ShellCommands.isMacSpoofingBlockedOnWiFi() {
+                        results.append("MAC spoofing: BLOCKED (Apple Silicon + macOS 14+)")
+                    } else {
+                        results.append("MAC spoofing: Available")
+                    }
+                }
+            } catch {
+                results.append("Network: \(error.localizedDescription)")
+            }
+
+            results.append("")
+            results.append("Dry run complete. No changes were made to your system.")
+            return results.joined(separator: "\n")
         }
     }
 
     func clearLogs() {
         logs.removeAll()
+    }
+
+    func runPreflight() {
+        preflight = PreflightInfo(status: .loading, checks: [])
+        Task {
+            var checks: [PreflightInfo.Check] = []
+
+            // macOS version
+            let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+            let osString = "macOS \(osVersion.majorVersion).\(osVersion.minorVersion).\(osVersion.patchVersion)"
+            checks.append(.init(id: "os", label: "macOS", value: osString, isWarning: osVersion.majorVersion < 13))
+
+            // Architecture
+            let arch = ShellCommands.machineArchitecture()
+            let archLabel = arch == "arm64" ? "Apple Silicon" : (arch == "x86_64" ? "Intel" : arch)
+            checks.append(.init(id: "arch", label: "Architecture", value: archLabel, isWarning: false))
+
+            // Zoom installed
+            let zoomInstalled = FileManager.default.fileExists(atPath: zoomBinaryPath)
+            checks.append(.init(id: "zoom", label: "Zoom App", value: zoomInstalled ? "Installed" : "Not found", isWarning: !zoomInstalled))
+
+            // Active interface & VPN
+            do {
+                let routeOutput = try await runProcess(
+                    stepName: "Preflight: detect interface",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", "/sbin/route -n get default 2>/dev/null"]
+                )
+                let device = try ShellCommands.parseDefaultRouteInterface(from: routeOutput)
+
+                let portsOutput = try await runProcess(
+                    stepName: "Preflight: hardware ports",
+                    executable: Constants.bashPath,
+                    arguments: ["-c", "/usr/sbin/networksetup -listallhardwareports"]
+                )
+                let portMap = ShellCommands.parseHardwarePorts(from: portsOutput)
+                let portName = portMap[device] ?? "Unknown"
+
+                checks.append(.init(id: "iface", label: "Active Interface", value: "\(portName) (\(device))", isWarning: false))
+                checks.append(.init(id: "vpn", label: "VPN", value: "Not detected", isWarning: false))
+            } catch {
+                let msg = error.localizedDescription
+                if msg.contains("VPN detected") {
+                    checks.append(.init(id: "vpn", label: "VPN", value: "Active (turn off before running)", isWarning: true))
+                } else {
+                    checks.append(.init(id: "iface", label: "Active Interface", value: "Could not detect", isWarning: true))
+                }
+            }
+
+            // Admin prompts expected (MAC spoofing + DNS flush both need admin)
+            checks.append(.init(id: "admin", label: "Admin Prompts", value: "Expected", isWarning: false))
+
+            // MAC spoofing availability
+            if ShellCommands.isMacSpoofingBlockedOnWiFi() {
+                checks.append(.init(id: "macspoof", label: "MAC Spoofing", value: "Blocked on Wi-Fi (Apple Silicon + macOS 14+)", isWarning: true))
+            }
+
+            preflight = PreflightInfo(status: .ready, checks: checks)
+        }
     }
 
     func copyLogs() {
@@ -156,12 +451,65 @@ done
         appendLog(text)
     }
 
+    func exportDiagnostics(appVersion: String) {
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let arch = ShellCommands.machineArchitecture()
+        let lastStatus = inferLastActionStatus()
+        let timestamp = Self.logTimestampFormatter.string(from: Date())
+
+        var lines: [String] = []
+        lines.append("1132 Fixer Diagnostics Report")
+        lines.append("Generated: \(timestamp)")
+        lines.append("App version: \(appVersion)")
+        lines.append("OS: \(osVersion)")
+        lines.append("Architecture: \(arch)")
+        lines.append("Last action status: \(lastStatus)")
+        lines.append("")
+
+        if let results = lastRunResults {
+            lines.append("--- Step Results ---")
+            for step in results {
+                let mark = step.succeeded ? "OK" : "WARN"
+                lines.append("[\(mark)] \(step.name)\(step.detail.map { " — \($0)" } ?? "")")
+            }
+            lines.append("")
+        }
+
+        if !preflight.checks.isEmpty {
+            lines.append("--- Preflight Checks ---")
+            for check in preflight.checks {
+                let mark = check.isWarning ? "!" : "+"
+                lines.append("[\(mark)] \(check.label): \(check.value)")
+            }
+            lines.append("")
+        }
+
+        lines.append("--- Activity Log (\(logs.count) entries) ---")
+        lines.append(contentsOf: logs)
+
+        let content = lines.joined(separator: "\n")
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "1132Fixer-diagnostics.txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try content.write(to: url, atomically: true, encoding: .utf8)
+            appendLog("Diagnostics exported to \(url.lastPathComponent)")
+        } catch {
+            appendLog("Failed to export diagnostics: \(error.localizedDescription)")
+        }
+    }
+
     func makeBugReportDraft(appVersion: String, maxLogLines: Int = 200) -> BugReportDraft {
         let now = Date()
         let title = "Bug Report \(Self.bugTitleFormatter.string(from: now))"
         let timestamp = Self.logTimestampFormatter.string(from: now)
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        let architecture = machineArchitecture()
+        let architecture = ShellCommands.machineArchitecture()
         let lastStatus = inferLastActionStatus()
         let recentLogs = Array(logs.suffix(maxLogLines))
         let logsBlock = recentLogs.isEmpty ? "No logs captured." : recentLogs.joined(separator: "\n")
@@ -187,16 +535,27 @@ Last action status: \(lastStatus)
         isRunning = true
         appendLog("=== \(title) ===")
 
-        Task {
-            defer { isRunning = false }
+        runningTask = Task {
+            defer {
+                isRunning = false
+                runningTask = nil
+                currentProcess = nil
+            }
             do {
+                try Task.checkCancellation()
                 let output = try await action()
                 if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     appendLog(output)
                 }
-                appendLog("Done.")
+                workflowState = .completed
+                appendLog("=== Completed ===")
+            } catch is CancellationError {
+                workflowState = .canceled
+                appendLog("=== Canceled ===")
             } catch {
+                workflowState = .failed(error.localizedDescription)
                 appendLog("Error: \(error.localizedDescription)")
+                appendLog("=== Failed ===")
             }
         }
     }
@@ -208,10 +567,10 @@ Last action status: \(lastStatus)
 
     private func inferLastActionStatus() -> String {
         for line in logs.reversed() {
-            if line.contains("Error:") {
+            if line.contains("=== Failed ===") {
                 return "Error"
             }
-            if line.contains("Done.") {
+            if line.contains("=== Completed ===") {
                 return "Completed"
             }
             if line.contains("=== Start Zoom ===") {
@@ -221,64 +580,43 @@ Last action status: \(lastStatus)
         return "Unknown"
     }
 
-    private func machineArchitecture() -> String {
-        var systemInfo = utsname()
-        uname(&systemInfo)
-        let mirror = Mirror(reflecting: systemInfo.machine)
-        let values = mirror.children.compactMap { child -> UInt8? in
-            guard let value = child.value as? Int8, value != 0 else { return nil }
-            return UInt8(value)
-        }
-        return String(bytes: values, encoding: .ascii) ?? "unknown"
-    }
-
-    private func isMacSpoofingBlockedOnWiFi() -> Bool {
-        // macOS 14 (Sonoma) and later block Wi-Fi MAC spoofing at the driver level on Apple Silicon.
-        let isAppleSilicon = machineArchitecture() == "arm64"
-        let isMacOS14OrLater = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14
-        return isAppleSilicon && isMacOS14OrLater
-    }
 
     private func spoofMACAndReconnectActiveInterface() async throws -> MACSpoofResult {
         let interface = try await resolveActiveSupportedInterface()
 
-        if interface.kind == .wifi && isMacSpoofingBlockedOnWiFi() {
-            return MACSpoofResult(
-                summary: """
-MAC spoofing skipped: Wi-Fi MAC spoofing is not supported on Apple Silicon Macs running macOS Sonoma (14) or later. \
-Zoom will be launched in a restricted sandbox environment instead, which forces it to generate a fresh device identity.
-"""
-            )
+        if interface.kind == .wifi && ShellCommands.isMacSpoofingBlockedOnWiFi() {
+            return try await resetPrivateWiFiAddressAndReconnect(networkService: interface.networkService, device: interface.device)
         }
 
-        let spoofedMAC = try generateRandomMACAddress()
+        let spoofedMAC = try ShellCommands.generateRandomMACAddress()
+        let spoofScript = ShellCommands.makeSpoofCommand(device: interface.device, spoofedMAC: spoofedMAC, networkService: interface.networkService)
 
-        let setMACCommand = "(/sbin/ifconfig \(shellSingleQuote(interface.device)) lladdr \(shellSingleQuote(spoofedMAC)) || /sbin/ifconfig \(shellSingleQuote(interface.device)) ether \(shellSingleQuote(spoofedMAC)))"
-        let interfaceDownCommand = "/sbin/ifconfig \(shellSingleQuote(interface.device)) down"
-        let interfaceUpCommand = "/sbin/ifconfig \(shellSingleQuote(interface.device)) up"
-        let disableServiceCommand = "/usr/sbin/networksetup -setnetworkserviceenabled \(shellSingleQuote(interface.networkService)) off"
-        let enableServiceCommand = "/usr/sbin/networksetup -setnetworkserviceenabled \(shellSingleQuote(interface.networkService)) on"
-        let sleepShort = "/bin/sleep 1"
-        let sleepReconnect = "/bin/sleep 2"
+        appendLog("Network recovery: commands to be attempted on \(interface.device) (service: \(interface.networkService))")
 
-        // Attempt MAC change with interface briefly down. Use semicolons (not &&) to ensure
-        // the interface and service are always restored even when MAC spoofing is blocked
-        // (e.g. by macOS restrictions). This prevents the Wi-Fi being left in a broken state.
-        let macAttempt = "(\(interfaceDownCommand) && \(sleepShort) && \(setMACCommand)) 2>/dev/null || true"
-        let restoreUp = "\(interfaceUpCommand) 2>/dev/null || true"
-        let recycleService = "\(disableServiceCommand) 2>/dev/null || true; \(sleepShort); \(enableServiceCommand)"
-        let spoofScript = "\(macAttempt); \(restoreUp); \(sleepShort); \(recycleService); \(sleepReconnect)"
+        let appleScript = ShellCommands.appleScriptDoShellScript(spoofScript, administratorPrivileges: true)
+        let commandOutput: String
+        do {
+            commandOutput = try await runProcess(
+                stepName: "Spoof MAC and reconnect \(interface.kind.rawValue)",
+                executable: Constants.osascriptPath,
+                arguments: ["-e", appleScript],
+                timeout: 90
+            )
+        } catch {
+            // Network step failed midway — log the exact commands and provide recovery
+            appendLog("Network recovery: MAC spoof command failed. Commands attempted:")
+            appendLog("  \(spoofScript)")
+            appendLog("""
+Network recovery: Your network interface may be in an inconsistent state. To restore manually:
+  1. Open System Settings > Network
+  2. Find '\(interface.networkService)' and turn it off, then on again
+  3. Or run in Terminal: sudo /sbin/ifconfig \(interface.device) up
+  4. If Wi-Fi is disconnected, click the Wi-Fi menu and reconnect to your network
+""")
+            throw error
+        }
 
-        let appleScript = appleScriptDoShellScript(spoofScript, administratorPrivileges: true)
-        let commandOutput = try await runProcess(
-            stepName: "Spoof MAC and reconnect \(interface.kind.rawValue)",
-            executable: Constants.osascriptPath,
-            arguments: ["-e", appleScript]
-        )
-
-        // Verify the MAC was actually changed. macOS or some network adapters silently
-        // ignore ifconfig MAC changes, which would leave Zoom with the same banned MAC.
-        let verifyScript = "/sbin/ifconfig \(shellSingleQuote(interface.device)) | /usr/bin/awk '/^[[:space:]]*ether /{print $2; exit}'"
+        let verifyScript = ShellCommands.makeVerifyMACCommand(device: interface.device)
         let actualMAC = (try? await runProcess(
             stepName: "Verify MAC address",
             executable: Constants.bashPath,
@@ -293,6 +631,8 @@ Zoom will be launched in a restricted sandbox environment instead, which forces 
             let detail = actualMAC.isEmpty
                 ? "Could not read the current MAC address after spoofing."
                 : "Current MAC (\(actualMAC)) does not match target (\(spoofedMAC))."
+            appendLog("Network recovery: MAC change was not applied. Commands attempted:")
+            appendLog("  \(spoofScript)")
             summary = """
 Warning: MAC address was not changed on \(interface.kind.rawValue) (\(interface.device)). \(detail)
 This is a known macOS limitation on Apple Silicon Macs (macOS Sonoma 14 and later): \
@@ -302,6 +642,9 @@ What you can try:
   2. Use your phone as a hotspot — this gives you a different network identity entirely.
   3. Turn on Private Wi-Fi Address for your network in System Settings > Wi-Fi, \
 disconnect, and reconnect before running Start Zoom again.
+If your network connection is disrupted after this step:
+  - Open System Settings > Network and toggle '\(interface.networkService)' off then on
+  - Or run in Terminal: sudo /sbin/ifconfig \(interface.device) up
 """
         }
 
@@ -317,36 +660,100 @@ disconnect, and reconnect before running Start Zoom again.
         return MACSpoofResult(summary: combinedSummary)
     }
 
+    private func resetPrivateWiFiAddressAndReconnect(networkService: String, device: String) async throws -> MACSpoofResult {
+        // 1. Check current private address mode
+        let getModeCmd = ShellCommands.makeGetPrivateAddressModeCommand(networkService: networkService)
+        let currentMode = (try? await runProcess(
+            stepName: "Check Private Wi-Fi Address mode",
+            executable: Constants.bashPath,
+            arguments: ["-c", getModeCmd]
+        ))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "unsupported"
+
+        appendLog("Private Wi-Fi Address mode: \(currentMode)")
+
+        var modeWasChanged = false
+
+        // 2. If not rotating, set it
+        if currentMode != "rotating" {
+            let setModeCmd = ShellCommands.makeSetPrivateAddressModeCommand(networkService: networkService, mode: "rotating")
+            let setModeScript = ShellCommands.appleScriptDoShellScript(setModeCmd, administratorPrivileges: false)
+            do {
+                _ = try await runProcess(
+                    stepName: "Enable rotating Private Wi-Fi Address",
+                    executable: Constants.osascriptPath,
+                    arguments: ["-e", setModeScript],
+                    timeout: 15
+                )
+                modeWasChanged = true
+                appendLog("Private Wi-Fi Address set to rotating (was: \(currentMode))")
+            } catch {
+                appendLog("Warning: Could not set Private Wi-Fi Address to rotating: \(error.localizedDescription)")
+            }
+        }
+
+        // 3. Cycle the interface to generate a new MAC — always brings it back up
+        let resetCmd = ShellCommands.makeRotatingMACResetCommand(networkService: networkService)
+        let resetScript = ShellCommands.appleScriptDoShellScript(resetCmd, administratorPrivileges: false)
+        do {
+            _ = try await runProcess(
+                stepName: "Reset Wi-Fi to generate new rotating MAC",
+                executable: Constants.osascriptPath,
+                arguments: ["-e", resetScript],
+                timeout: 30
+            )
+        } catch {
+            appendLog("Warning: Wi-Fi cycle encountered an error: \(error.localizedDescription)")
+            // Interface was already brought back up by the command — log and continue
+        }
+
+        // 4. Read the new MAC for logging
+        let verifyScript = ShellCommands.makeVerifyMACCommand(device: device)
+        let newMAC = (try? await runProcess(
+            stepName: "Read new MAC address",
+            executable: Constants.bashPath,
+            arguments: ["-c", verifyScript]
+        ))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(could not read)"
+
+        let modeNote = modeWasChanged
+            ? "Private Wi-Fi Address changed to rotating (was: \(currentMode)). "
+            : "Private Wi-Fi Address was already set to rotating. "
+
+        return MACSpoofResult(
+            summary: "\(modeNote)Wi-Fi cycled to generate new rotating MAC. Current MAC: \(newMAC)"
+        )
+    }
+
     private func resolveActiveSupportedInterface() async throws -> NetworkInterfaceInfo {
         let defaultRouteOutput = try await runProcess(
             stepName: "Detect active network interface",
             executable: Constants.bashPath,
             arguments: ["-c", "/sbin/route -n get default"]
         )
-        let activeDevice = try parseDefaultRouteInterface(from: defaultRouteOutput)
+        let activeDevice = try ShellCommands.parseDefaultRouteInterface(from: defaultRouteOutput)
 
         let hardwarePortsOutput = try await runProcess(
             stepName: "Inspect hardware ports",
             executable: Constants.bashPath,
             arguments: ["-c", "/usr/sbin/networksetup -listallhardwareports"]
         )
-        let hardwarePortMap = parseHardwarePorts(from: hardwarePortsOutput)
+        let hardwarePortMap = ShellCommands.parseHardwarePorts(from: hardwarePortsOutput)
 
         guard let hardwarePortName = hardwarePortMap[activeDevice] else {
             throw appError("Detect active network interface: Could not map interface '\(activeDevice)' to a hardware port.")
         }
 
-        let kind = try classifySupportedInterface(hardwarePortName: hardwarePortName)
+        let scKind = try ShellCommands.classifySupportedInterface(hardwarePortName: hardwarePortName)
+        let kind: NetworkInterfaceInfo.Kind = scKind == .wifi ? .wifi : .ethernet
 
         let serviceOrderOutput = try await runProcess(
             stepName: "Inspect network services",
             executable: Constants.bashPath,
             arguments: ["-c", "/usr/sbin/networksetup -listnetworkserviceorder"]
         )
-        let serviceMap = parseNetworkServiceOrder(from: serviceOrderOutput)
+        let serviceMap = ShellCommands.parseNetworkServiceOrder(from: serviceOrderOutput)
 
         guard let networkService = serviceMap[activeDevice], !networkService.isEmpty else {
-            throw appError("Detect active network interface: Could not resolve network service for interface '\(activeDevice)'.")
+            throw appError("Detect active network interface: Could not resolve network service for interface '\(activeDevice)'. This can happen if the interface was renamed in System Settings or if a third-party network tool is managing your connection. Check System Settings > Network and ensure your connection is listed.")
         }
 
         return NetworkInterfaceInfo(
@@ -357,312 +764,8 @@ disconnect, and reconnect before running Start Zoom again.
         )
     }
 
-    private func parseDefaultRouteInterface(from output: String) throws -> String {
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("interface:") else { continue }
-
-            let value = line.dropFirst("interface:".count).trimmingCharacters(in: .whitespaces)
-            guard isSafeInterfaceName(value) else {
-                throw appError("Detect active network interface: Invalid interface name '\(value)'.")
-            }
-            try ensureVPNIsNotActive(interfaceName: value)
-            return value
-        }
-
-        throw appError("Detect active network interface: No default route interface was found. Connect to Wi-Fi or Ethernet and try again.")
-    }
-
-    private func ensureVPNIsNotActive(interfaceName: String) throws {
-        let normalized = interfaceName.lowercased()
-        let vpnPrefixes = ["utun", "ipsec", "ppp", "tun", "tap"]
-
-        if vpnPrefixes.contains(where: normalized.hasPrefix) {
-            throw appError("VPN detected on interface '\(interfaceName)'. Turn off your VPN and run Start Zoom again.")
-        }
-    }
-
-    private func parseHardwarePorts(from output: String) -> [String: String] {
-        var result: [String: String] = [:]
-        var currentHardwarePort: String?
-
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-
-            if line.hasPrefix("Hardware Port:") {
-                currentHardwarePort = String(line.dropFirst("Hardware Port:".count)).trimmingCharacters(in: .whitespaces)
-                continue
-            }
-
-            if line.hasPrefix("Device:"), let hardwarePort = currentHardwarePort {
-                let device = String(line.dropFirst("Device:".count)).trimmingCharacters(in: .whitespaces)
-                if isSafeInterfaceName(device) {
-                    result[device] = hardwarePort
-                }
-            }
-        }
-
-        return result
-    }
-
-    private func classifySupportedInterface(hardwarePortName: String) throws -> NetworkInterfaceInfo.Kind {
-        let normalized = hardwarePortName.lowercased()
-
-        if normalized.contains("wi-fi") || normalized.contains("wifi") {
-            return .wifi
-        }
-        if normalized.contains("ethernet") {
-            return .ethernet
-        }
-
-        throw appError("Detect active network interface: Active interface '\(hardwarePortName)' is not supported. Only Wi-Fi and Ethernet are supported.")
-    }
-
-    private func parseNetworkServiceOrder(from output: String) -> [String: String] {
-        var result: [String: String] = [:]
-        var pendingServiceName: String?
-
-        let pattern = #"\(Hardware Port: .*?, Device: ([^)]+)\)"#
-        let regex = try? NSRegularExpression(pattern: pattern)
-
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty else { continue }
-
-            if line.hasPrefix("("), let closingParen = line.firstIndex(of: ")"), line.index(after: closingParen) < line.endIndex {
-                let nameStart = line.index(after: closingParen)
-                let serviceName = line[nameStart...].trimmingCharacters(in: .whitespaces)
-                if !serviceName.isEmpty && !serviceName.hasPrefix("*") {
-                    pendingServiceName = serviceName
-                } else {
-                    pendingServiceName = nil
-                }
-                continue
-            }
-
-            guard line.hasPrefix("(Hardware Port:"), let serviceName = pendingServiceName, let regex else { continue }
-            let nsLine = line as NSString
-            let range = NSRange(location: 0, length: nsLine.length)
-            guard let match = regex.firstMatch(in: line, options: [], range: range), match.numberOfRanges > 1 else { continue }
-
-            let deviceRange = match.range(at: 1)
-            guard deviceRange.location != NSNotFound else { continue }
-
-            let device = nsLine.substring(with: deviceRange).trimmingCharacters(in: .whitespaces)
-            if isSafeInterfaceName(device) {
-                result[device] = serviceName
-            }
-        }
-
-        return result
-    }
-
-
     private func makeLaunchZoomCommand() -> String {
-        guard FileManager.default.fileExists(atPath: zoomBinaryPath) else {
-            return #"""
-echo "Launch mode: directOpenFallback"
-/usr/bin/open -a "zoom.us"
-"""#
-        }
-        // Prefer the camera-safe bootstrap launch, but automatically escalate to the more
-        // aggressive long-running sandbox if process-state heuristics suggest the bootstrap
-        // did not stick. This keeps as much of the 1.3.5 bypass behavior as possible while
-        // still giving 1.3.6-style normal camera access the first chance to work.
-        let profile = """
-(version 1)
-(allow default)
-(allow device-camera)
-(allow device-microphone)
-(deny iokit-get-properties
-    (iokit-property "IOPlatformSerialNumber")
-    (iokit-property "IOPlatformUUID")
-    (iokit-property "board-id")
-    (iokit-property "IOMACAddress")
-)
-(deny file-read-data
-    (literal "/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist")
-)
-"""
-        let encodedProfile = Data(profile.utf8).base64EncodedString()
-        return """
-/bin/bash -c '
-set -u
-
-zoom_binary=\(shellSingleQuote(zoomBinaryPath))
-encoded_profile=\(shellSingleQuote(encodedProfile))
-profile_path="$(/usr/bin/mktemp "/tmp/1132fixer.zoom-sandbox.XXXXXX")" || exit 1
-
-cleanup() {
-  /bin/rm -f "$profile_path"
-}
-
-wait_for_pid_runtime() {
-  pid="$1"
-  seconds="$2"
-  i=0
-  while [ "$i" -lt "$seconds" ]; do
-    if ! /bin/kill -0 "$pid" 2>/dev/null; then
-      return 1
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 0
-}
-
-wait_for_pid_exit() {
-  pid="$1"
-  attempts="$2"
-  i=0
-  while [ "$i" -lt "$attempts" ]; do
-    if ! /bin/kill -0 "$pid" 2>/dev/null; then
-      return 0
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-
-wait_for_zoom_stability() {
-  required_consecutive="$1"
-  max_attempts="$2"
-  i=0
-  stable=0
-  while [ "$i" -lt "$max_attempts" ]; do
-    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-      stable=$((stable + 1))
-      if [ "$stable" -ge "$required_consecutive" ]; then
-        return 0
-      fi
-    else
-      stable=0
-    fi
-    /bin/sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
-
-stop_zoom_processes() {
-  if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-    /usr/bin/killall "zoom.us" 2>/dev/null || true
-    for i in {1..6}; do
-      /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1 || break
-      /bin/sleep 0.5
-    done
-    if /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-      /usr/bin/killall -9 "zoom.us" 2>/dev/null || true
-      /bin/sleep 1
-    fi
-  fi
-}
-
-launch_persistent_sandbox() {
-  echo "Launch mode escalated: persistentSandbox"
-  /usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
-  persistent_pid=$!
-  /bin/sleep 2
-  if /bin/kill -0 "$persistent_pid" 2>/dev/null || /usr/bin/pgrep -x "zoom.us" >/dev/null 2>&1; then
-    echo "Heuristic: persistent sandbox launch detected"
-    return 0
-  fi
-  echo "Heuristic: persistent sandbox launch detected = no"
-  return 1
-}
-
-trap cleanup EXIT
-/bin/echo "$encoded_profile" | /usr/bin/base64 --decode > "$profile_path" || exit 1
-
-echo "Launch mode: bootstrapThenNormal"
-/usr/bin/sandbox-exec -f "$profile_path" "$zoom_binary" >/dev/null 2>&1 &
-bootstrap_pid=$!
-/bin/sleep 1
-
-if /bin/kill -0 "$bootstrap_pid" 2>/dev/null; then
-  echo "Heuristic: bootstrap started"
-else
-  echo "Heuristic: bootstrap started = no"
-  echo "Heuristic: fallback triggered (bootstrap process missing)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
-
-if wait_for_pid_runtime "$bootstrap_pid" 11; then
-  echo "Heuristic: bootstrap survived minimum runtime"
-else
-  echo "Heuristic: bootstrap survived minimum runtime = no"
-  echo "Heuristic: fallback triggered (bootstrap exited too quickly)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
-
-/bin/kill "$bootstrap_pid" 2>/dev/null || true
-if wait_for_pid_exit "$bootstrap_pid" 5; then
-  echo "Heuristic: bootstrap shutdown confirmed"
-else
-  echo "Heuristic: bootstrap shutdown confirmed = no"
-fi
-
-/usr/bin/open -na "zoom.us"
-if wait_for_zoom_stability 1 6; then
-  echo "Heuristic: normal relaunch detected"
-else
-  echo "Heuristic: normal relaunch detected = no"
-  echo "Heuristic: fallback triggered (normal relaunch not detected)"
-  stop_zoom_processes
-  launch_persistent_sandbox || exit 1
-  exit 0
-fi
-
-if wait_for_zoom_stability 4 12; then
-  echo "Heuristic: normal relaunch stabilized"
-  exit 0
-fi
-
-echo "Heuristic: normal relaunch stabilized = no"
-echo "Heuristic: fallback triggered (normal relaunch unstable)"
-stop_zoom_processes
-launch_persistent_sandbox || exit 1
-'
-"""
-    }
-
-    private func generateRandomMACAddress() throws -> String {
-        var bytes = (0..<6).map { _ in UInt8.random(in: 0...255) }
-        bytes[0] = (bytes[0] | 0x02) & 0xFE // locally administered + unicast
-
-        let mac = bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
-        guard isValidMACAddress(mac) else {
-            throw appError("Generate MAC address: Failed to generate a valid MAC address.")
-        }
-
-        return mac
-    }
-
-    private func isValidMACAddress(_ value: String) -> Bool {
-        let pattern = #"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$"#
-        return value.range(of: pattern, options: .regularExpression) != nil
-    }
-
-    private func isSafeInterfaceName(_ value: String) -> Bool {
-        let pattern = #"^[a-zA-Z0-9]+$"#
-        return value.range(of: pattern, options: .regularExpression) != nil
-    }
-
-    private func shellSingleQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: #"'\"'\"'"#) + "'"
-    }
-
-    private func appleScriptDoShellScript(_ command: String, administratorPrivileges: Bool) -> String {
-        let escapedCommand = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let privilegeClause = administratorPrivileges ? " with administrator privileges" : ""
-        return "do shell script \"\(escapedCommand)\"\(privilegeClause)"
+        ShellCommands.makeLaunchZoomCommand()
     }
 
     private func appError(_ message: String) -> NSError {
@@ -673,10 +776,13 @@ launch_persistent_sandbox || exit 1
         )
     }
 
-    private func runProcess(stepName: String, executable: String, arguments: [String]) async throws -> String {
+    private func runProcess(stepName: String, executable: String, arguments: [String], timeout: TimeInterval = 60) async throws -> String {
+        try Task.checkCancellation()
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        currentProcess = process
 
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -686,6 +792,19 @@ launch_persistent_sandbox || exit 1
         return try await withCheckedThrowingContinuation { continuation in
             let stdoutBuffer = LockedDataBuffer()
             let stderrBuffer = LockedDataBuffer()
+            var hasResumed = false
+            let resumeLock = NSLock()
+
+            @Sendable func safeResume(_ result: Result<String, Error>) {
+                resumeLock.lock()
+                defer { resumeLock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                switch result {
+                case .success(let value): continuation.resume(returning: value)
+                case .failure(let error): continuation.resume(throwing: error)
+                }
+            }
 
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let chunk = handle.availableData
@@ -699,8 +818,25 @@ launch_persistent_sandbox || exit 1
                 stderrBuffer.append(chunk)
             }
 
+            // Timeout timer
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.schedule(deadline: .now() + timeout)
+            timer.setEventHandler {
+                process.terminate()
+                DispatchQueue.main.async {
+                    self.appendLog("Timeout: '\(stepName)' did not complete within \(Int(timeout))s — terminating.")
+                }
+                safeResume(.failure(NSError(
+                    domain: Constants.errorDomain,
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "\(stepName): Timed out after \(Int(timeout)) seconds."]
+                )))
+            }
+            timer.resume()
+
             do {
                 process.terminationHandler = { terminatedProcess in
+                    timer.cancel()
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
 
@@ -714,7 +850,7 @@ launch_persistent_sandbox || exit 1
                         .joined(separator: "\n")
 
                     if terminatedProcess.terminationStatus == 0 {
-                        continuation.resume(returning: combined)
+                        safeResume(.success(combined))
                         return
                     }
 
@@ -723,21 +859,22 @@ launch_persistent_sandbox || exit 1
                     if !trimmedOutput.isEmpty {
                         message = "\(stepName): \(trimmedOutput)"
                     } else if executable == Constants.osascriptPath {
-                        message = "\(stepName): Admin authorization was canceled or failed."
+                        message = "\(stepName): Admin authorization was canceled or failed. This step requires your macOS password to run with elevated privileges. Click Start Zoom again and enter your password when prompted."
                     } else {
                         message = "\(stepName): Command failed with exit code \(terminatedProcess.terminationStatus)."
                     }
 
-                    continuation.resume(throwing: NSError(
+                    safeResume(.failure(NSError(
                         domain: Constants.errorDomain,
                         code: Int(terminatedProcess.terminationStatus),
                         userInfo: [NSLocalizedDescriptionKey: message]
-                    ))
+                    )))
                 }
 
                 try process.run()
             } catch {
-                continuation.resume(throwing: error)
+                timer.cancel()
+                safeResume(.failure(error))
             }
         }
     }
@@ -776,8 +913,11 @@ struct ContentView: View {
                     websiteURL: websiteURL,
                     onReportBug: { showBugReportForm = true },
                     isReportBugDisabled: isReportingBug,
+                    onExportDiagnostics: { vm.exportDiagnostics(appVersion: appVersion) },
                     appVersion: appVersion
                 )
+
+                PreflightPanel(preflight: vm.preflight)
 
                 HStack(spacing: 14) {
                     ActionCard(
@@ -790,6 +930,35 @@ struct ContentView: View {
                             vm.startZoom()
                         }
                     )
+
+                    if vm.isRunning {
+                        ActionCard(
+                            title: "Cancel",
+                            subtitle: "Stop the running workflow.",
+                            systemImage: "xmark.circle.fill",
+                            tint: Color.red.opacity(0.8),
+                            isDisabled: false,
+                            action: {
+                                vm.cancelWorkflow()
+                            }
+                        )
+                        .transition(.opacity)
+                    } else {
+                        ActionCard(
+                            title: "Dry Run",
+                            subtitle: "Check system state without making any changes.",
+                            systemImage: "eye.circle.fill",
+                            tint: Color(red: 0.55, green: 0.55, blue: 0.62),
+                            isDisabled: vm.isRunning,
+                            action: {
+                                vm.dryRun()
+                            }
+                        )
+                    }
+                }
+
+                if let progress = vm.workflowProgress {
+                    WorkflowProgressBar(progress: progress)
                 }
 
                 LogPanel(logs: vm.logs, onCopy: vm.copyLogs, onClear: vm.clearLogs)
@@ -798,7 +967,8 @@ struct ContentView: View {
             .padding(.top, 20)
             .padding(.bottom, 20)
         }
-        .frame(width: 760, height: 520)
+        .frame(minWidth: 620, minHeight: 520)
+        .onAppear { vm.runPreflight() }
         .task {
             // Only check for updates in packaged apps that have a real version.
             guard appVersion != "dev" else { return }
@@ -932,11 +1102,11 @@ private struct HeaderCard: View {
     let websiteURL: URL
     let onReportBug: () -> Void
     let isReportBugDisabled: Bool
+    let onExportDiagnostics: () -> Void
     let appVersion: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(Color.white.opacity(0.14))
@@ -946,33 +1116,37 @@ private struct HeaderCard: View {
                     .foregroundStyle(.white)
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("1132 Fixer")
-                    .font(.system(size: 29, weight: .black, design: .rounded))
-                    .foregroundStyle(.white)
+            Text("1132 Fixer")
+                .font(.system(size: 29, weight: .black, design: .rounded))
+                .foregroundStyle(.white)
 
-                Text("Bypass Error 1132 with one action. No more messing with config files or terminal commands.")
-                    .font(.system(size: 13, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.82))
+            Spacer()
 
-                Text("Version \(appVersion)")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.72))
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    HeaderLinkButton(title: "GitHub", systemImage: "link.circle.fill", destination: repositoryURL)
+                        .frame(maxWidth: .infinity)
+                    HeaderLinkButton(title: "Website", systemImage: "globe", destination: websiteURL)
+                        .frame(maxWidth: .infinity)
+                }
+                HStack(spacing: 8) {
+                    HeaderActionButton(
+                        title: "Report a bug",
+                        systemImage: "ladybug.fill",
+                        isDisabled: isReportBugDisabled,
+                        action: onReportBug
+                    )
+                    .frame(maxWidth: .infinity)
+                    HeaderActionButton(
+                        title: "Export Diagnostics",
+                        systemImage: "square.and.arrow.up",
+                        isDisabled: false,
+                        action: onExportDiagnostics
+                    )
+                    .frame(maxWidth: .infinity)
+                }
             }
-
-                Spacer()
-            }
-
-            HStack(spacing: 10) {
-                HeaderLinkButton(title: "GitHub", systemImage: "link.circle.fill", destination: repositoryURL)
-                HeaderLinkButton(title: "Website", systemImage: "globe", destination: websiteURL)
-                HeaderActionButton(
-                    title: "Report a bug",
-                    systemImage: "ladybug.fill",
-                    isDisabled: isReportBugDisabled,
-                    action: onReportBug
-                )
-            }
+            .frame(width: 280)
         }
         .padding(18)
         .background(
@@ -994,7 +1168,6 @@ private struct HeaderLinkButton: View {
     var body: some View {
         Link(destination: destination) {
             Label(title, systemImage: systemImage)
-                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.plain)
         .modifier(HeaderButtonChrome())
@@ -1010,7 +1183,6 @@ private struct HeaderActionButton: View {
     var body: some View {
         Button(action: action) {
             Label(title, systemImage: systemImage)
-                .frame(maxWidth: .infinity)
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
@@ -1085,6 +1257,143 @@ private struct ActionCard: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+    }
+}
+
+private struct WorkflowProgressBar: View {
+    let progress: AppViewModel.WorkflowProgress
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(progress.steps) { step in
+                VStack(spacing: 3) {
+                    stepIcon(step.state)
+                        .font(.system(size: 10))
+                    Text(step.name)
+                        .font(.system(size: 9, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.ultraThinMaterial.opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func stepIcon(_ state: AppViewModel.WorkflowProgress.StepState) -> some View {
+        switch state {
+        case .pending:
+            Image(systemName: "circle")
+                .foregroundStyle(.white.opacity(0.3))
+        case .running:
+            ProgressView()
+                .controlSize(.mini)
+        case .succeeded:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.red)
+        case .skipped:
+            Image(systemName: "minus.circle")
+                .foregroundStyle(.yellow)
+        }
+    }
+}
+
+private struct PreflightPanel: View {
+    let preflight: AppViewModel.PreflightInfo
+
+    private static let supportMatrix: [(label: String, supported: Bool)] = [
+        ("Intel", true),
+        ("Apple Silicon", true),
+        ("macOS 13", true),
+        ("macOS 14+", true),
+        ("Wi-Fi", true),
+        ("Ethernet", true),
+        ("VPN", false),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Preflight Checks", systemImage: "checklist")
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+
+            switch preflight.status {
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Checking system...")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+            case .error(let msg):
+                Text(msg)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.red.opacity(0.9))
+            case .ready:
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading, spacing: 6) {
+                    ForEach(preflight.checks) { check in
+                        HStack(spacing: 6) {
+                            Image(systemName: check.isWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(check.isWarning ? .yellow : .green)
+                            Text(check.label + ":")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.72))
+                            Text(check.value)
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.92))
+                        }
+                    }
+                }
+            }
+
+            Divider().background(Color.white.opacity(0.12))
+
+            HStack(spacing: 6) {
+                Text("Supported:")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.5))
+                ForEach(Self.supportMatrix, id: \.label) { item in
+                    Text(item.label)
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(item.supported ? .white.opacity(0.8) : .white.opacity(0.4))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(item.supported ? Color.green.opacity(0.18) : Color.red.opacity(0.15))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .stroke(item.supported ? Color.green.opacity(0.25) : Color.red.opacity(0.2), lineWidth: 0.5)
+                        )
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.ultraThinMaterial.opacity(0.7))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
     }
 }
 

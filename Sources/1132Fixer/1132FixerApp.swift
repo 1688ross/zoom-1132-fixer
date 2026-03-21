@@ -20,7 +20,7 @@ struct Fixer1132App: App {
         WindowGroup {
             ContentView()
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified(showsTitle: false))
         .windowStyle(.hiddenTitleBar)
     }
