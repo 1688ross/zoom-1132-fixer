@@ -144,13 +144,16 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
   decode_base64_to_file "$CERTIFICATE_P12_FILE"
 
   KEYCHAIN_PATH="$TEMP_BUILD_ROOT/build-signing.keychain-db"
-  KEYCHAIN_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+  KEYCHAIN_PASSWORD="$(uuidgen | tr -d '-')$(uuidgen | tr -d '-')"
+  KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:0:32}"
 
   echo "==> Importing signing certificate into temporary keychain"
+  rm -f "$KEYCHAIN_PATH"
   security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
   security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
   security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
   security import "$CERTIFICATE_P12_FILE" \
+    -f pkcs12 \
     -k "$KEYCHAIN_PATH" \
     -P "$APPLE_CERTIFICATE_PASSWORD" \
     -T /usr/bin/codesign \
