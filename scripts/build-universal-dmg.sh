@@ -8,6 +8,7 @@ BUNDLE_ID="com.local.1132fixer"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION_FILE="$ROOT_DIR/VERSION"
+APPLE_DEVELOPER_FILE="${APPLE_DEVELOPER_FILE:-$ROOT_DIR/apple-developer.txt}"
 MIN_MACOS_FILE="$ROOT_DIR/MIN_MACOS_VERSION"
 BUG_REPORT_ENDPOINT_RESOURCE_FILE="$ROOT_DIR/Sources/1132Fixer/Resources/FIXER_BUG_REPORT_ENDPOINT"
 BUG_REPORT_TOKEN_RESOURCE_FILE="$ROOT_DIR/Sources/1132Fixer/Resources/FIXER_BUG_REPORT_TOKEN"
@@ -51,26 +52,47 @@ fi
 DMG_PATH="$DIST_DIR/$APP_NAME-v$APP_VERSION-universal.dmg"
 DMG_STAGING_DIR="$TEMP_BUILD_ROOT/dmg-staging"
 
-# Required for distribution: Developer ID Application identity from your keychain.
+# Required for distribution: Developer ID Application identity.
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 
 # Set NOTARIZE=0 to skip notarization.
 NOTARIZE="${NOTARIZE:-1}"
 
-# Notarization credentials (required when NOTARIZE=1).
-APPLE_API_KEY_ID="${APPLE_API_KEY_ID:-}"
-APPLE_API_ISSUER_ID="${APPLE_API_ISSUER_ID:-}"
-APPLE_API_PRIVATE_KEY="${APPLE_API_PRIVATE_KEY:-}"
-APPLE_API_KEY_PATH="${APPLE_API_KEY_PATH:-}"
+APPLE_ID="${APPLE_ID:-}"
+APPLE_PASSWORD="${APPLE_PASSWORD:-}"
+APPLE_TEAM_ID="${APPLE_TEAM_ID:-}"
+APPLE_CERTIFICATE="${APPLE_CERTIFICATE:-}"
+APPLE_CERTIFICATE_PASSWORD="${APPLE_CERTIFICATE_PASSWORD:-}"
 
-if [[ -z "$SIGN_IDENTITY" ]]; then
-  echo "Missing SIGN_IDENTITY. Example:" >&2
-  echo "  SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' $0" >&2
-  exit 1
+if [[ -f "$APPLE_DEVELOPER_FILE" ]]; then
+  echo "==> Loading Apple developer settings from $APPLE_DEVELOPER_FILE"
+  # apple-developer.txt is stored as simple KEY=VALUE assignments.
+  set -a
+  # shellcheck disable=SC1090
+  source "$APPLE_DEVELOPER_FILE"
+  set +a
 fi
+
+decode_base64_to_file() {
+  local destination="$1"
+
+  if printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$destination" 2>/dev/null; then
+    return 0
+  fi
+
+  if printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$destination" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Failed to decode APPLE_CERTIFICATE." >&2
+  exit 1
+}
 
 BUG_REPORT_ENDPOINT_BACKUP_FILE=""
 BUG_REPORT_TOKEN_BACKUP_FILE=""
+CERTIFICATE_P12_FILE=""
+KEYCHAIN_PATH=""
+KEYCHAIN_PASSWORD=""
 cleanup_bug_report_resources() {
   if [[ -n "$BUG_REPORT_ENDPOINT_BACKUP_FILE" && -f "$BUG_REPORT_ENDPOINT_BACKUP_FILE" ]]; then
     cp "$BUG_REPORT_ENDPOINT_BACKUP_FILE" "$BUG_REPORT_ENDPOINT_RESOURCE_FILE"
@@ -79,6 +101,12 @@ cleanup_bug_report_resources() {
   if [[ -n "$BUG_REPORT_TOKEN_BACKUP_FILE" && -f "$BUG_REPORT_TOKEN_BACKUP_FILE" ]]; then
     cp "$BUG_REPORT_TOKEN_BACKUP_FILE" "$BUG_REPORT_TOKEN_RESOURCE_FILE"
     rm -f "$BUG_REPORT_TOKEN_BACKUP_FILE"
+  fi
+  if [[ -n "$CERTIFICATE_P12_FILE" && -f "$CERTIFICATE_P12_FILE" ]]; then
+    rm -f "$CERTIFICATE_P12_FILE"
+  fi
+  if [[ -n "$KEYCHAIN_PATH" && -f "$KEYCHAIN_PATH" ]]; then
+    security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup_bug_report_resources EXIT
@@ -105,6 +133,45 @@ fi
 
 rm -rf "$DIST_DIR" "$TEMP_BUILD_ROOT"
 mkdir -p "$DIST_DIR" "$UNIVERSAL_DIR"
+
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" ]]; then
+    echo "Missing signing configuration. Set SIGN_IDENTITY or provide APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD in $APPLE_DEVELOPER_FILE." >&2
+    exit 1
+  fi
+
+  CERTIFICATE_P12_FILE="$(mktemp -t fixer-signing-certificate.XXXXXX.p12)"
+  decode_base64_to_file "$CERTIFICATE_P12_FILE"
+
+  KEYCHAIN_PATH="$TEMP_BUILD_ROOT/build-signing.keychain-db"
+  KEYCHAIN_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+
+  echo "==> Importing signing certificate into temporary keychain"
+  security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+  security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+  security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+  security import "$CERTIFICATE_P12_FILE" \
+    -k "$KEYCHAIN_PATH" \
+    -P "$APPLE_CERTIFICATE_PASSWORD" \
+    -T /usr/bin/codesign \
+    -T /usr/bin/security >/dev/null
+  security set-key-partition-list \
+    -S apple-tool:,apple:,codesign: \
+    -s \
+    -k "$KEYCHAIN_PASSWORD" \
+    "$KEYCHAIN_PATH" >/dev/null
+
+  SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application: / { print $2; exit }')"
+  if [[ -z "$SIGN_IDENTITY" ]]; then
+    echo "Unable to locate a Developer ID Application identity in the imported certificate." >&2
+    exit 1
+  fi
+fi
+
+codesign_args=()
+if [[ -n "$KEYCHAIN_PATH" ]]; then
+  codesign_args+=(--keychain "$KEYCHAIN_PATH")
+fi
 
 echo "==> Building arm64 release binary"
 swift build -c release --arch arm64 --scratch-path "$ARM64_BUILD_DIR"
@@ -181,7 +248,7 @@ if [[ -f "$SOURCE_APP_ICON" ]]; then
 fi
 
 echo "==> Signing app bundle ($SIGN_IDENTITY)"
-codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_BUNDLE_DIR"
+codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "${codesign_args[@]}" "$APP_BUNDLE_DIR"
 codesign --verify --strict --verbose=2 "$APP_BUNDLE_DIR"
 
 echo "==> Creating DMG"
@@ -192,33 +259,21 @@ ln -s /Applications "$DMG_STAGING_DIR/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING_DIR" -ov -format UDZO "$DMG_PATH"
 
 echo "==> Signing DMG ($SIGN_IDENTITY)"
-codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
+codesign --force --timestamp --sign "$SIGN_IDENTITY" "${codesign_args[@]}" "$DMG_PATH"
 codesign --verify --verbose=2 "$DMG_PATH"
 
 if [[ "$NOTARIZE" == "1" ]]; then
   echo "==> Notarizing DMG"
 
-  if [[ -z "$APPLE_API_KEY_ID" || -z "$APPLE_API_ISSUER_ID" ]]; then
-    echo "Missing APPLE_API_KEY_ID or APPLE_API_ISSUER_ID for notarization." >&2
-    exit 1
-  fi
-
-  KEY_FILE=""
-  if [[ -n "$APPLE_API_KEY_PATH" ]]; then
-    KEY_FILE="$APPLE_API_KEY_PATH"
-  elif [[ -n "$APPLE_API_PRIVATE_KEY" ]]; then
-    KEY_FILE="$(mktemp -t "AuthKey.XXXXXX.p8")"
-    trap 'rm -f "$KEY_FILE"' EXIT
-    printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KEY_FILE"
-  else
-    echo "Provide APPLE_API_KEY_PATH or APPLE_API_PRIVATE_KEY for notarization." >&2
+  if [[ -z "$APPLE_ID" || -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+    echo "Missing APPLE_ID, APPLE_PASSWORD, or APPLE_TEAM_ID for notarization." >&2
     exit 1
   fi
 
   xcrun notarytool submit "$DMG_PATH" \
-    --key "$KEY_FILE" \
-    --key-id "$APPLE_API_KEY_ID" \
-    --issuer "$APPLE_API_ISSUER_ID" \
+    --apple-id "$APPLE_ID" \
+    --password "$APPLE_PASSWORD" \
+    --team-id "$APPLE_TEAM_ID" \
     --wait
 
   echo "==> Stapling notarization ticket"

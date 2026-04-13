@@ -814,6 +814,20 @@ If your network connection is disrupted after this step:
         )
     }
 
+    private final class ContinuationResumeGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hasResumed = false
+
+        func beginResume() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+
+            guard !hasResumed else { return false }
+            hasResumed = true
+            return true
+        }
+    }
+
     private func runProcess(stepName: String, executable: String, arguments: [String], timeout: TimeInterval = 60) async throws -> String {
         try Task.checkCancellation()
 
@@ -830,14 +844,10 @@ If your network connection is disrupted after this step:
         return try await withCheckedThrowingContinuation { continuation in
             let stdoutBuffer = LockedDataBuffer()
             let stderrBuffer = LockedDataBuffer()
-            var hasResumed = false
-            let resumeLock = NSLock()
+            let resumeGate = ContinuationResumeGate()
 
             @Sendable func safeResume(_ result: Result<String, Error>) {
-                resumeLock.lock()
-                defer { resumeLock.unlock() }
-                guard !hasResumed else { return }
-                hasResumed = true
+                guard resumeGate.beginResume() else { return }
                 switch result {
                 case .success(let value): continuation.resume(returning: value)
                 case .failure(let error): continuation.resume(throwing: error)
