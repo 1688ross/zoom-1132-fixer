@@ -93,6 +93,8 @@ BUG_REPORT_TOKEN_BACKUP_FILE=""
 CERTIFICATE_P12_FILE=""
 KEYCHAIN_PATH=""
 KEYCHAIN_PASSWORD=""
+SIGN_IDENTITY_HASH=""
+ORIGINAL_KEYCHAINS=()
 cleanup_bug_report_resources() {
   if [[ -n "$BUG_REPORT_ENDPOINT_BACKUP_FILE" && -f "$BUG_REPORT_ENDPOINT_BACKUP_FILE" ]]; then
     cp "$BUG_REPORT_ENDPOINT_BACKUP_FILE" "$BUG_REPORT_ENDPOINT_RESOURCE_FILE"
@@ -104,6 +106,9 @@ cleanup_bug_report_resources() {
   fi
   if [[ -n "$CERTIFICATE_P12_FILE" && -f "$CERTIFICATE_P12_FILE" ]]; then
     rm -f "$CERTIFICATE_P12_FILE"
+  fi
+  if [[ "${#ORIGINAL_KEYCHAINS[@]}" -gt 0 ]]; then
+    security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
   fi
   if [[ -n "$KEYCHAIN_PATH" && -f "$KEYCHAIN_PATH" ]]; then
     security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
@@ -152,19 +157,31 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
   security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
   security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
   security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+  while IFS= read -r existing_keychain; do
+    existing_keychain="${existing_keychain//\"/}"
+    if [[ -n "$existing_keychain" ]]; then
+      ORIGINAL_KEYCHAINS+=("$existing_keychain")
+    fi
+  done < <(security list-keychains -d user)
   security import "$CERTIFICATE_P12_FILE" \
     -f pkcs12 \
     -k "$KEYCHAIN_PATH" \
     -P "$APPLE_CERTIFICATE_PASSWORD" \
     -T /usr/bin/codesign \
     -T /usr/bin/security >/dev/null
+  security list-keychains -d user -s "$KEYCHAIN_PATH" "${ORIGINAL_KEYCHAINS[@]}" >/dev/null
   security set-key-partition-list \
     -S apple-tool:,apple:,codesign: \
     -s \
     -k "$KEYCHAIN_PASSWORD" \
     "$KEYCHAIN_PATH" >/dev/null
 
+  SIGN_IDENTITY_HASH="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/Developer ID Application: / { print $2; exit }')"
   SIGN_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application: / { print $2; exit }')"
+  if [[ -z "$SIGN_IDENTITY_HASH" ]]; then
+    echo "Unable to locate a Developer ID Application identity hash in the imported certificate." >&2
+    exit 1
+  fi
   if [[ -z "$SIGN_IDENTITY" ]]; then
     echo "Unable to locate a Developer ID Application identity in the imported certificate." >&2
     exit 1
@@ -251,7 +268,7 @@ if [[ -f "$SOURCE_APP_ICON" ]]; then
 fi
 
 echo "==> Signing app bundle ($SIGN_IDENTITY)"
-codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "${codesign_args[@]}" "$APP_BUNDLE_DIR"
+codesign --force --deep --options runtime --timestamp --sign "${SIGN_IDENTITY_HASH:-$SIGN_IDENTITY}" "${codesign_args[@]}" "$APP_BUNDLE_DIR"
 codesign --verify --strict --verbose=2 "$APP_BUNDLE_DIR"
 
 echo "==> Creating DMG"
@@ -262,7 +279,7 @@ ln -s /Applications "$DMG_STAGING_DIR/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING_DIR" -ov -format UDZO "$DMG_PATH"
 
 echo "==> Signing DMG ($SIGN_IDENTITY)"
-codesign --force --timestamp --sign "$SIGN_IDENTITY" "${codesign_args[@]}" "$DMG_PATH"
+codesign --force --timestamp --sign "${SIGN_IDENTITY_HASH:-$SIGN_IDENTITY}" "${codesign_args[@]}" "$DMG_PATH"
 codesign --verify --verbose=2 "$DMG_PATH"
 
 if [[ "$NOTARIZE" == "1" ]]; then
