@@ -8,7 +8,8 @@ final class AppViewModel: ObservableObject {
     struct BugReportDraft {
         let title: String
         let systemInfo: String
-        let recentLogs: String
+        let diagnosticsFileName: String
+        let diagnosticsData: Data
     }
 
     private struct NetworkInterfaceInfo {
@@ -25,6 +26,7 @@ final class AppViewModel: ObservableObject {
 
     private struct MACSpoofResult {
         let summary: String
+        let hasWarning: Bool
     }
 
     private enum Constants {
@@ -61,6 +63,7 @@ final class AppViewModel: ObservableObject {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
         return formatter
     }()
+    private static let diagnosticsFileName = "1132Fixer-diagnostics.txt"
 
     enum WorkflowState: Equatable {
         case idle
@@ -168,11 +171,10 @@ final class AppViewModel: ObservableObject {
             let macSpoofResult: MACSpoofResult
             do {
                 macSpoofResult = try await self.spoofMACAndReconnectActiveInterface()
-                let isWarning = macSpoofResult.summary.contains("Warning:")
-                self.markStepDone("macSpoof", succeeded: !isWarning)
-                results.append(.init(id: "macSpoof", name: "MAC Spoof & Network", succeeded: !isWarning, detail: macSpoofResult.summary))
+                self.markStepDone("macSpoof", succeeded: !macSpoofResult.hasWarning)
+                results.append(.init(id: "macSpoof", name: "MAC Spoof & Network", succeeded: !macSpoofResult.hasWarning, detail: macSpoofResult.summary))
             } catch {
-                macSpoofResult = MACSpoofResult(summary: "MAC spoofing skipped: \(error.localizedDescription)")
+                macSpoofResult = MACSpoofResult(summary: "MAC spoofing skipped: \(error.localizedDescription)", hasWarning: true)
                 self.markStepDone("macSpoof", succeeded: false)
                 results.append(.init(id: "macSpoof", name: "MAC Spoof & Network", succeeded: false, detail: error.localizedDescription))
             }
@@ -452,6 +454,47 @@ final class AppViewModel: ObservableObject {
     }
 
     func exportDiagnostics(appVersion: String) {
+        let diagnostics = makeDiagnosticsExport(appVersion: appVersion)
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = diagnostics.fileName
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try diagnostics.content.write(to: url, atomically: true, encoding: .utf8)
+            appendLog("Diagnostics exported to \(url.lastPathComponent)")
+        } catch {
+            appendLog("Failed to export diagnostics: \(error.localizedDescription)")
+        }
+    }
+
+    func makeBugReportDraft(appVersion: String) -> BugReportDraft {
+        let now = Date()
+        let title = "Bug Report \(Self.bugTitleFormatter.string(from: now))"
+        let timestamp = Self.logTimestampFormatter.string(from: now)
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        let architecture = ShellCommands.machineArchitecture()
+        let lastStatus = inferLastActionStatus()
+        let systemInfo = """
+App version: \(appVersion)
+OS: \(osVersion)
+Architecture: \(architecture)
+Timestamp: \(timestamp)
+Last action status: \(lastStatus)
+"""
+        let diagnostics = makeDiagnosticsExport(appVersion: appVersion)
+        return BugReportDraft(
+            title: title,
+            systemInfo: systemInfo,
+            diagnosticsFileName: diagnostics.fileName,
+            diagnosticsData: Data(diagnostics.content.utf8)
+        )
+    }
+
+    private func makeDiagnosticsExport(appVersion: String, maxLogLines: Int? = nil) -> (fileName: String, content: String) {
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
         let arch = ShellCommands.machineArchitecture()
         let lastStatus = inferLastActionStatus()
@@ -484,43 +527,17 @@ final class AppViewModel: ObservableObject {
             lines.append("")
         }
 
-        lines.append("--- Activity Log (\(logs.count) entries) ---")
-        lines.append(contentsOf: logs)
-
-        let content = lines.joined(separator: "\n")
-
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "1132Fixer-diagnostics.txt"
-        panel.allowedContentTypes = [.plainText]
-        panel.canCreateDirectories = true
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        do {
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            appendLog("Diagnostics exported to \(url.lastPathComponent)")
-        } catch {
-            appendLog("Failed to export diagnostics: \(error.localizedDescription)")
+        let logLines: [String]
+        if let maxLogLines {
+            logLines = Array(logs.suffix(maxLogLines))
+        } else {
+            logLines = logs
         }
-    }
 
-    func makeBugReportDraft(appVersion: String, maxLogLines: Int = 200) -> BugReportDraft {
-        let now = Date()
-        let title = "Bug Report \(Self.bugTitleFormatter.string(from: now))"
-        let timestamp = Self.logTimestampFormatter.string(from: now)
-        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        let architecture = ShellCommands.machineArchitecture()
-        let lastStatus = inferLastActionStatus()
-        let recentLogs = Array(logs.suffix(maxLogLines))
-        let logsBlock = recentLogs.isEmpty ? "No logs captured." : recentLogs.joined(separator: "\n")
-        let systemInfo = """
-App version: \(appVersion)
-OS: \(osVersion)
-Architecture: \(architecture)
-Timestamp: \(timestamp)
-Last action status: \(lastStatus)
-"""
-        return BugReportDraft(title: title, systemInfo: systemInfo, recentLogs: logsBlock)
+        lines.append("--- Activity Log (\(logLines.count) entries) ---")
+        lines.append(contentsOf: logLines)
+
+        return (Self.diagnosticsFileName, lines.joined(separator: "\n"))
     }
 
     private func runTask(
@@ -657,7 +674,10 @@ If your network connection is disrupted after this step:
             combinedSummary = "\(summary)\n\(trimmedCommandOutput)"
         }
 
-        return MACSpoofResult(summary: combinedSummary)
+        return MACSpoofResult(
+            summary: combinedSummary,
+            hasWarning: combinedSummary.contains("Warning:")
+        )
     }
 
     private func resetPrivateWiFiAddressAndReconnect(networkService: String, device: String) async throws -> MACSpoofResult {
@@ -672,9 +692,12 @@ If your network connection is disrupted after this step:
         appendLog("Private Wi-Fi Address mode: \(currentMode)")
 
         var modeWasChanged = false
+        var warnings: [String] = []
 
         // 2. If not rotating, set it
-        if currentMode != "rotating" {
+        if currentMode == "unsupported" {
+            warnings.append("Warning: Private Wi-Fi Address controls are unsupported on this macOS/networksetup version.")
+        } else if currentMode != "rotating" {
             let setModeCmd = ShellCommands.makeSetPrivateAddressModeCommand(networkService: networkService, mode: "rotating")
             let setModeScript = ShellCommands.appleScriptDoShellScript(setModeCmd, administratorPrivileges: false)
             do {
@@ -687,12 +710,14 @@ If your network connection is disrupted after this step:
                 modeWasChanged = true
                 appendLog("Private Wi-Fi Address set to rotating (was: \(currentMode))")
             } catch {
-                appendLog("Warning: Could not set Private Wi-Fi Address to rotating: \(error.localizedDescription)")
+                let warning = "Warning: Could not set Private Wi-Fi Address to rotating: \(error.localizedDescription)"
+                warnings.append(warning)
+                appendLog(warning)
             }
         }
 
         // 3. Cycle the interface to generate a new MAC — always brings it back up
-        let resetCmd = ShellCommands.makeRotatingMACResetCommand(networkService: networkService)
+        let resetCmd = ShellCommands.makeRotatingMACResetCommand(device: device)
         let resetScript = ShellCommands.appleScriptDoShellScript(resetCmd, administratorPrivileges: false)
         do {
             _ = try await runProcess(
@@ -702,7 +727,9 @@ If your network connection is disrupted after this step:
                 timeout: 30
             )
         } catch {
-            appendLog("Warning: Wi-Fi cycle encountered an error: \(error.localizedDescription)")
+            let warning = "Warning: Wi-Fi cycle encountered an error: \(error.localizedDescription)"
+            warnings.append(warning)
+            appendLog(warning)
             // Interface was already brought back up by the command — log and continue
         }
 
@@ -714,12 +741,23 @@ If your network connection is disrupted after this step:
             arguments: ["-c", verifyScript]
         ))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(could not read)"
 
-        let modeNote = modeWasChanged
-            ? "Private Wi-Fi Address changed to rotating (was: \(currentMode)). "
-            : "Private Wi-Fi Address was already set to rotating. "
+        let modeNote: String
+        if currentMode == "unsupported" {
+            modeNote = "Private Wi-Fi Address mode could not be verified on this system. "
+        } else if modeWasChanged {
+            modeNote = "Private Wi-Fi Address changed to rotating (was: \(currentMode)). "
+        } else if currentMode == "rotating" {
+            modeNote = "Private Wi-Fi Address was already set to rotating. "
+        } else {
+            modeNote = "Private Wi-Fi Address remained \(currentMode). "
+        }
+
+        var summaryParts = ["\(modeNote)Wi-Fi cycled to generate new rotating MAC. Current MAC: \(newMAC)"]
+        summaryParts.append(contentsOf: warnings)
 
         return MACSpoofResult(
-            summary: "\(modeNote)Wi-Fi cycled to generate new rotating MAC. Current MAC: \(newMAC)"
+            summary: summaryParts.joined(separator: "\n"),
+            hasWarning: !warnings.isEmpty
         )
     }
 
@@ -1033,7 +1071,8 @@ struct ContentView: View {
                 email: trimmedEmail.isEmpty ? nil : trimmedEmail,
                 message: reportMessage,
                 systemInfo: draft.systemInfo,
-                recentLogs: draft.recentLogs
+                diagnosticsFileName: draft.diagnosticsFileName,
+                diagnosticsData: draft.diagnosticsData
             )
             vm.logMessage("Bug report submitted successfully.")
             showBugReportForm = false

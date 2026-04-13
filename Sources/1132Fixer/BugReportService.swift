@@ -6,22 +6,7 @@ enum BugReportService {
     private static let endpointEnvVar = "FIXER_BUG_REPORT_ENDPOINT"
     private static let tokenEnvVar = "FIXER_BUG_REPORT_TOKEN"
     private static let defaultEndpoint = "https://1132-bug-report-production.up.railway.app/api/bug-report"
-
-    private struct BugReportRequest: Encodable {
-        let title: String
-        let email: String?
-        let message: String
-        let systemInfo: String
-        let recentLogs: String
-
-        enum CodingKeys: String, CodingKey {
-            case title = "Title"
-            case email = "Email"
-            case message = "Message"
-            case systemInfo = "System Info"
-            case recentLogs = "Recent Logs"
-        }
-    }
+    private static let uploadFieldName = "file"
 
     private static func resolveConfigValue(envVar: String, fallback: String = "") -> String {
         let envValue = ProcessInfo.processInfo.environment[envVar]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -68,7 +53,8 @@ enum BugReportService {
         email: String?,
         message: String,
         systemInfo: String,
-        recentLogs: String
+        diagnosticsFileName: String,
+        diagnosticsData: Data
     ) async throws {
         let endpoint = resolveConfigValue(envVar: endpointEnvVar, fallback: defaultEndpoint)
         let token = resolveConfigValue(envVar: tokenEnvVar)
@@ -91,18 +77,19 @@ enum BugReportService {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 15
-        request.httpBody = try JSONEncoder().encode(
-            BugReportRequest(
-                title: title,
-                email: email,
-                message: message,
-                systemInfo: systemInfo,
-                recentLogs: recentLogs
-            )
+        let boundary = "Boundary-\(UUID().uuidString)"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = makeMultipartBody(
+            boundary: boundary,
+            title: title,
+            email: email,
+            message: message,
+            systemInfo: systemInfo,
+            diagnosticsFileName: diagnosticsFileName,
+            diagnosticsData: diagnosticsData
         )
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -132,4 +119,51 @@ enum BugReportService {
             )
         }
     }
+
+    private static func makeMultipartBody(
+        boundary: String,
+        title: String,
+        email: String?,
+        message: String,
+        systemInfo: String,
+        diagnosticsFileName: String,
+        diagnosticsData: Data
+    ) -> Data {
+        var body = Data()
+
+        func appendTextField(_ name: String, value: String) {
+            body.append("--\(boundary)\r\n".utf8Data)
+            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".utf8Data)
+            body.append(value.utf8Data)
+            body.append("\r\n".utf8Data)
+        }
+
+        appendTextField("Title", value: title)
+        if let email, !email.isEmpty {
+            appendTextField("Email", value: email)
+        }
+        appendTextField("Message", value: message)
+        appendTextField("System Info", value: systemInfo)
+
+        body.append("--\(boundary)\r\n".utf8Data)
+        body.append(
+            "Content-Disposition: form-data; name=\"\(uploadFieldName)\"; filename=\"\(escapedHeaderValue(diagnosticsFileName))\"\r\n".utf8Data
+        )
+        body.append("Content-Type: text/plain\r\n\r\n".utf8Data)
+        body.append(diagnosticsData)
+        body.append("\r\n".utf8Data)
+        body.append("--\(boundary)--\r\n".utf8Data)
+
+        return body
+    }
+
+    private static func escapedHeaderValue(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+}
+
+private extension String {
+    var utf8Data: Data { Data(utf8) }
 }

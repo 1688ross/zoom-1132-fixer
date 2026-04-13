@@ -249,10 +249,10 @@ Turn off your VPN, wait a few seconds for your normal connection to restore, and
 
     /// Cycles the Wi-Fi interface off then on to generate a new rotating MAC address.
     /// The interface is always brought back up, even if the down step fails.
-    static func makeRotatingMACResetCommand(networkService: String) -> String {
-        let off = "/usr/sbin/networksetup -setairportpower \(shellSingleQuote(networkService)) off"
+    static func makeRotatingMACResetCommand(device: String) -> String {
+        let off = "/usr/sbin/networksetup -setairportpower \(shellSingleQuote(device)) off"
         let sleep1 = "/bin/sleep 1"
-        let on = "/usr/sbin/networksetup -setairportpower \(shellSingleQuote(networkService)) on"
+        let on = "/usr/sbin/networksetup -setairportpower \(shellSingleQuote(device)) on"
         let sleep2 = "/bin/sleep 2"
         // Always run `on`, regardless of whether `off` succeeded
         return "{ \(off); \(sleep1); } 2>/dev/null || true; \(on); \(sleep2)"
