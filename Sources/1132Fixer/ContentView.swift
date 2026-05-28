@@ -714,6 +714,15 @@ If your network connection is disrupted after this step:
             arguments: ["-c", verifyScript]
         ))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(could not read)"
 
+        // If the address is locally administered (Private Wi-Fi Address set to
+        // Rotating/Fixed), the cycle already refreshed a randomized MAC and there
+        // is nothing left for the user to do — report success instead of warning.
+        if warnings.isEmpty && ShellCommands.isLocallyAdministeredMAC(currentMAC) {
+            let summary = "Private Wi-Fi Address active on \(device) (service: \(networkService)). Wi-Fi cycled to refresh the randomized MAC. Current MAC: \(currentMAC)"
+            appendLog(summary)
+            return MACSpoofResult(summary: summary, hasWarning: false)
+        }
+
         let guidance = """
 MAC spoofing is blocked on Apple Silicon Macs (macOS Sonoma 14 and later), so the Wi-Fi MAC \
 cannot be changed automatically. To rotate it yourself, open System Settings > Wi-Fi > \

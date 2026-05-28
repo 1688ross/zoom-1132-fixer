@@ -93,6 +93,14 @@ enum ShellCommands {
         return value.range(of: pattern, options: .regularExpression) != nil
     }
 
+    /// Returns true if the MAC is valid and has the locally-administered bit set
+    /// (0x02 in the first octet), e.g. a Private Wi-Fi Address (randomized) MAC.
+    static func isLocallyAdministeredMAC(_ value: String) -> Bool {
+        guard isValidMACAddress(value) else { return false }
+        guard let firstOctet = UInt8(value.prefix(2), radix: 16) else { return false }
+        return (firstOctet & 0x02) != 0
+    }
+
     // MARK: - Interface Validation
 
     static func isSafeInterfaceName(_ value: String) -> Bool {

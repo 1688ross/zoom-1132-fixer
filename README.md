@@ -1,12 +1,22 @@
 # 1132 Fixer
 
-## [Download the latest release here](https://github.com/PrimeUpYourLife/1132-fixer/releases/latest)
+## [Download the latest release here](https://github.com/1688ross/zoom-1132-fixer/releases/latest)
 
 ## [Discuss on Telegram](https://t.me/Team1132Fixer)
 
 <img src="Sources/1132Fixer/Resources/AppIcon.png" width="128" alt="1132 Fixer app icon">
 
-![GitHub Release](https://img.shields.io/github/v/release/PrimeUpYourLife/1132-fixer?style=for-the-badge) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/PrimeUpYourLife/1132-fixer/total?style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-silicone-yellow?logo=apple&style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-intel-purple?logo=apple&style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-universal-green?logo=apple&style=for-the-badge)
+![GitHub Release](https://img.shields.io/github/v/release/1688ross/zoom-1132-fixer?style=for-the-badge) ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/1688ross/zoom-1132-fixer/total?style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-silicone-yellow?logo=apple&style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-intel-purple?logo=apple&style=for-the-badge) ![Static Badge](https://img.shields.io/badge/mac-universal-green?logo=apple&style=for-the-badge)
+
+## Install
+
+1. Download the latest `1132 Fixer-<version>-universal.dmg` from the [Releases page](https://github.com/1688ross/zoom-1132-fixer/releases/latest).
+2. Open the DMG and drag **1132 Fixer** into your **Applications** folder.
+3. The first launch is blocked because the app is not signed by an Apple Developer. To open it:
+   - Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**, then launch the app again and confirm. (On older macOS: right-click the app → **Open**.)
+   - Or, in Terminal: `xattr -dr com.apple.quarantine "/Applications/1132 Fixer.app"`
+
+The app is a universal build and runs on both Apple Silicon and Intel Macs.
 
 ## Minimal macOS app with two actions
 

@@ -39,6 +39,14 @@ struct ShellCommandsTests {
         #expect(!ShellCommands.isValidMACAddress("GG:HH:II:JJ:KK:LL"))
     }
 
+    @Test func locallyAdministeredMAC() {
+        #expect(ShellCommands.isLocallyAdministeredMAC("72:82:a9:83:6d:4c"))
+        #expect(ShellCommands.isLocallyAdministeredMAC("02:ab:cd:ef:12:34"))
+        #expect(!ShellCommands.isLocallyAdministeredMAC("00:1b:63:84:45:e6"))
+        #expect(!ShellCommands.isLocallyAdministeredMAC("(could not read)"))
+        #expect(!ShellCommands.isLocallyAdministeredMAC(""))
+    }
+
     @Test func generateRandomMACAddress() throws {
         let mac = try ShellCommands.generateRandomMACAddress()
         #expect(ShellCommands.isValidMACAddress(mac))
