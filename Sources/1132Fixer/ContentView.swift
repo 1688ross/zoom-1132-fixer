@@ -681,47 +681,20 @@ If your network connection is disrupted after this step:
     }
 
     private func resetPrivateWiFiAddressAndReconnect(networkService: String, device: String) async throws -> MACSpoofResult {
-        // 1. Check current private address mode
-        let getModeCmd = ShellCommands.makeGetPrivateAddressModeCommand(networkService: networkService)
-        let currentMode = (try? await runProcess(
-            stepName: "Check Private Wi-Fi Address mode",
-            executable: Constants.bashPath,
-            arguments: ["-c", getModeCmd]
-        ))?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "unsupported"
-
-        appendLog("Private Wi-Fi Address mode: \(currentMode)")
-
-        var modeWasChanged = false
+        // On Apple Silicon (macOS 14+), the OS blocks driver-level Wi-Fi MAC spoofing,
+        // and macOS exposes no `networksetup` command to read or set a network's
+        // "Private Wi-Fi Address" (MAC randomization) mode. The only supported action
+        // here is cycling the Wi-Fi interface; a new randomized MAC is produced only
+        // when the user has already enabled "Private Wi-Fi Address: Rotating" for this
+        // network in System Settings.
         var warnings: [String] = []
 
-        // 2. If not rotating, set it
-        if currentMode == "unsupported" {
-            warnings.append("Warning: Private Wi-Fi Address controls are unsupported on this macOS/networksetup version.")
-        } else if currentMode != "rotating" {
-            let setModeCmd = ShellCommands.makeSetPrivateAddressModeCommand(networkService: networkService, mode: "rotating")
-            let setModeScript = ShellCommands.appleScriptDoShellScript(setModeCmd, administratorPrivileges: false)
-            do {
-                _ = try await runProcess(
-                    stepName: "Enable rotating Private Wi-Fi Address",
-                    executable: Constants.osascriptPath,
-                    arguments: ["-e", setModeScript],
-                    timeout: 15
-                )
-                modeWasChanged = true
-                appendLog("Private Wi-Fi Address set to rotating (was: \(currentMode))")
-            } catch {
-                let warning = "Warning: Could not set Private Wi-Fi Address to rotating: \(error.localizedDescription)"
-                warnings.append(warning)
-                appendLog(warning)
-            }
-        }
-
-        // 3. Cycle the interface to generate a new MAC — always brings it back up
+        // Cycle the interface — always brings it back up, even if the down step fails.
         let resetCmd = ShellCommands.makeRotatingMACResetCommand(device: device)
         let resetScript = ShellCommands.appleScriptDoShellScript(resetCmd, administratorPrivileges: false)
         do {
             _ = try await runProcess(
-                stepName: "Reset Wi-Fi to generate new rotating MAC",
+                stepName: "Cycle Wi-Fi to refresh MAC address",
                 executable: Constants.osascriptPath,
                 arguments: ["-e", resetScript],
                 timeout: 30
@@ -733,31 +706,31 @@ If your network connection is disrupted after this step:
             // Interface was already brought back up by the command — log and continue
         }
 
-        // 4. Read the new MAC for logging
+        // Read the current MAC for logging.
         let verifyScript = ShellCommands.makeVerifyMACCommand(device: device)
-        let newMAC = (try? await runProcess(
-            stepName: "Read new MAC address",
+        let currentMAC = (try? await runProcess(
+            stepName: "Read current MAC address",
             executable: Constants.bashPath,
             arguments: ["-c", verifyScript]
         ))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "(could not read)"
 
-        let modeNote: String
-        if currentMode == "unsupported" {
-            modeNote = "Private Wi-Fi Address mode could not be verified on this system. "
-        } else if modeWasChanged {
-            modeNote = "Private Wi-Fi Address changed to rotating (was: \(currentMode)). "
-        } else if currentMode == "rotating" {
-            modeNote = "Private Wi-Fi Address was already set to rotating. "
-        } else {
-            modeNote = "Private Wi-Fi Address remained \(currentMode). "
-        }
+        let guidance = """
+MAC spoofing is blocked on Apple Silicon Macs (macOS Sonoma 14 and later), so the Wi-Fi MAC \
+cannot be changed automatically. To rotate it yourself, open System Settings > Wi-Fi > \
+'\(networkService)' Details, set 'Private Wi-Fi Address' to 'Rotating', then disconnect and \
+reconnect before running Start Zoom again.
+"""
+        appendLog(guidance)
 
-        var summaryParts = ["\(modeNote)Wi-Fi cycled to generate new rotating MAC. Current MAC: \(newMAC)"]
+        var summaryParts = [
+            "Wi-Fi cycled on \(device) (service: \(networkService)). Current MAC: \(currentMAC)",
+            guidance,
+        ]
         summaryParts.append(contentsOf: warnings)
 
         return MACSpoofResult(
             summary: summaryParts.joined(separator: "\n"),
-            hasWarning: !warnings.isEmpty
+            hasWarning: true
         )
     }
 

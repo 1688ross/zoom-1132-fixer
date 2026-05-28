@@ -202,6 +202,14 @@ struct ShellCommandsTests {
         #expect(cmd.contains("ether"))
     }
 
+    @Test func makeRotatingMACResetCommand() {
+        let cmd = ShellCommands.makeRotatingMACResetCommand(device: "en0")
+        #expect(cmd.contains("-setairportpower 'en0' off"))
+        #expect(cmd.contains("-setairportpower 'en0' on"))
+        // The interface must always be brought back up, even if the down step fails.
+        #expect(cmd.contains("|| true"))
+    }
+
     // MARK: - Machine Architecture
 
     @Test func machineArchitecture() {

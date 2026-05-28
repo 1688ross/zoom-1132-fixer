@@ -237,15 +237,13 @@ Turn off your VPN, wait a few seconds for your normal connection to restore, and
         return isAppleSilicon && isMacOS14OrLater
     }
 
-    // MARK: - Private Wi-Fi Address (Rotating MAC)
+    // MARK: - Wi-Fi Interface Cycle
 
-    static func makeGetPrivateAddressModeCommand(networkService: String) -> String {
-        "/usr/sbin/networksetup -getPrivateNetworkAddress \(shellSingleQuote(networkService)) 2>/dev/null || echo 'unsupported'"
-    }
-
-    static func makeSetPrivateAddressModeCommand(networkService: String, mode: String) -> String {
-        "/usr/sbin/networksetup -setPrivateNetworkAddress \(shellSingleQuote(networkService)) \(shellSingleQuote(mode))"
-    }
+    // Note: macOS exposes no `networksetup` command to read or set a network's
+    // "Private Wi-Fi Address" (MAC randomization) mode. Earlier versions called
+    // non-existent `-getPrivateNetworkAddress`/`-setPrivateNetworkAddress` verbs,
+    // which made `networksetup` dump its full usage text and fail. The only
+    // supported action here is cycling the Wi-Fi interface below.
 
     /// Cycles the Wi-Fi interface off then on to generate a new rotating MAC address.
     /// The interface is always brought back up, even if the down step fails.
